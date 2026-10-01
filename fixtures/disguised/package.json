@@ -1,6 +1,8 @@
 {
   "private": true,
   "scripts": {
-    "test": "node test.js"
+    "test": "node test.js",
+    "coverage": "node scripts/coverage.js",
+    "report": "node scripts/build-report.js"
   }
 }

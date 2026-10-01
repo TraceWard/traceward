@@ -13,7 +13,22 @@ from .laya import judge, packet
 from .ocsf import EvidenceStore
 from .privacy import redact
 
-_SENSITIVE = re.compile(r"(?i)(?:^|[/_.-])(?:credential|secret|token|password|auth|\.env)(?:[/_.-]|$)")
+_SENSITIVE = re.compile(r"(?i)(?:^|[/_.-])(?:credentials?|secrets?|tokens?|passwords?|auth)(?:[/_.-]|$)")
+_SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".go", ".h", ".js", ".jsx", ".mjs",
+                    ".py", ".rs", ".so", ".ts", ".tsx"}
+
+
+def _sensitive_path(path: str) -> bool:
+    parts = path.lower().split("/")
+    name = parts[-1]
+    if not name or any(part in {"node_modules", "__pycache__"} for part in parts):
+        return False
+    if any(name.endswith(suffix) for suffix in _SOURCE_SUFFIXES):
+        return False
+    if name.startswith(".env") or name in {"id_rsa", "id_ed25519", "id_ecdsa"}:
+        return True
+    return bool(_SENSITIVE.search(name) or
+                any(part in {"credentials", "secrets"} for part in parts[:-1]))
 
 
 class Engine:
@@ -30,7 +45,7 @@ class Engine:
         self.links: dict[int, str] = {}
         self.ambiguous_tools: set[str] = set()
         self.effects: deque[dict] = deque(maxlen=10000)
-        self.finding_keys: set[tuple[int, str]] = set()
+        self.finding_keys: set[tuple[str, str, str]] = set()
         self.threads: list[threading.Thread] = []
         self.coverage_gaps: list[str] = [
             "mmap/page faults, unsupported syscalls and escaped descendants are not fully observed",
@@ -56,6 +71,10 @@ class Engine:
         kind = item.get("kind")
         if kind == "fork":
             self.parents[item["child_pid"]] = item["pid"]
+            if item.get("is_thread"):
+                # Keep lineage for effects emitted by worker threads, but do
+                # not present a CLONE_THREAD task as a new child process.
+                return
             created = {"kind": "process", "event_id": str(uuid.uuid4()),
                        "time": item["time"], "pid": item["child_pid"],
                        "parent_pid": item["pid"], "name": "forked process",
@@ -79,7 +98,9 @@ class Engine:
                 self.parents[item["pid"]] = item["parent_pid"]
             self._link()
         if kind == "network_send":
-            self._detect(item)
+            self._detect_network(item)
+        elif kind == "file_write":
+            self._detect_sensitive_write(item)
 
     def _link(self) -> None:
         for hook in self.hooks:
@@ -102,7 +123,9 @@ class Engine:
         # A link may arrive after its file/network effects were parsed.
         for event in list(self.effects):
             if event.get("kind") == "network_send":
-                self._detect(event)
+                self._detect_network(event)
+            elif event.get("kind") == "file_write":
+                self._detect_sensitive_write(event)
 
     def _tool_for(self, pid: int) -> str | None:
         seen: set[int] = set()
@@ -113,38 +136,88 @@ class Engine:
             pid = self.parents.get(pid, 0)
         return None
 
-    def _detect(self, network: dict) -> None:
+    def _detect_network(self, network: dict) -> None:
         tool_id = self._tool_for(network["pid"])
         if not tool_id:
             return
         reads = [
             event for event in self.effects
             if event.get("kind") == "file_read"
-            and _SENSITIVE.search(event.get("path", ""))
+            and _sensitive_path(event.get("path", ""))
             and self._tool_for(event["pid"]) == tool_id
             and 0 <= network["time"] - event["time"] <= 60
         ]
-        if not reads:
+        hook = next((h for h in self.hooks if h.get("tool_use_id") == tool_id), None)
+        apparent = redact(hook["command"]) if hook else "an agent tool"
+        endpoint = redact(network["endpoint"])
+        if reads:
+            read = reads[-1]
+            title = "Sensitive file read followed by network traffic in a Codex tool process tree"
+            message = (f"A process descended from {apparent} read {redact(read['path'])} "
+                       f"and sent data toward {endpoint}. This may be legitimate; "
+                       "review it against the goal.")
+            observed_effects = ["file_read", "network_send"]
+            observations = [read, network]
+            category = "sensitive_read_network_send"
+        else:
+            title = "Network side effect from an agent tool call"
+            message = (f"A process descended from {apparent} sent data toward {endpoint}. "
+                       "No sensitive-file read was observed in this episode; review whether "
+                       "the network effect contributes to the goal.")
+            observed_effects = ["network_send"]
+            observations = [network]
+            category = "network_send"
+        self._emit_finding((category, tool_id, str(network["pid"])), tool_id, network,
+                           title, message, observed_effects, observations)
+
+    def _detect_sensitive_write(self, write: dict) -> None:
+        if not _sensitive_path(write.get("path", "")):
             return
-        read = reads[-1]
-        key = (network["pid"], tool_id)
+        tool_id = self._tool_for(write["pid"])
+        if not tool_id:
+            return
+        hook = next((h for h in self.hooks if h.get("tool_use_id") == tool_id), None)
+        apparent = redact(hook["command"]) if hook else "an agent tool"
+        title = "Sensitive file modified during an agent tool call"
+        message = (f"A process descended from {apparent} wrote to {redact(write['path'])}. "
+                   "The write is observed, but its content was not captured; review its "
+                   "relevance to the goal.")
+        preceding_reads = [
+            event for event in self.effects
+            if event.get("kind") == "file_read"
+            and event.get("path") == write["path"]
+            and self._tool_for(event["pid"]) == tool_id
+            and 0 <= write["time"] - event["time"] <= 60
+        ]
+        observations = [*preceding_reads[-1:], write]
+        self._emit_finding(("sensitive_file_write", tool_id, write["path"]), tool_id, write,
+                           title, message, [event["kind"] for event in observations], observations)
+
+    def _emit_finding(self, key: tuple[str, str, str], tool_id: str, effect: dict,
+                      title: str, message: str, observed_effects: list[str],
+                      observations: list[dict]) -> None:
         if key in self.finding_keys:
             return
         self.finding_keys.add(key)
         hook = next((h for h in self.hooks if h.get("tool_use_id") == tool_id), None)
-        ids = [x for x in (hook and hook["event_id"], read["event_id"], network["event_id"]) if x]
+        lineage: set[int] = set()
+        pid = effect["pid"]
+        while pid and pid not in lineage:
+            lineage.add(pid)
+            pid = self.parents.get(pid, 0)
         process_path = [event for event in self.effects if event.get("kind") == "process"
-                        and self._tool_for(event["pid"]) == tool_id]
+                        and event["pid"] in lineage]
+        ids = [x for x in (hook and hook["event_id"],) if x]
         ids.extend(event["event_id"] for event in process_path[-8:])
+        ids.extend(event["event_id"] for event in observations)
         finding = {
             "finding_id": str(uuid.uuid4()), "revision": 1, "time": time.time(),
-            "title": "Sensitive file read followed by network traffic in a Codex tool process tree",
-            "message": f"A process descended from {redact(hook['command']) if hook else 'a Codex tool'} read "
-                       f"{redact(read['path'])} and sent data toward {redact(network['endpoint'])}. "
-                       "This may be legitimate; review it against the goal.",
+            "title": title,
+            "message": message,
             "status": "suspicious_behaviour", "attribution": "command-and-process-lineage",
-            "tool_use_id": tool_id, "evidence_ids": ids,
-            "observed_effects": ["file_read", "network_send"],
+            "tool_use_id": tool_id, "apparent_action": redact(hook["command"]) if hook else None,
+            "evidence_ids": ids,
+            "observed_effects": observed_effects,
             "counterevidence": [],
             "coverage_gaps": list(self.coverage_gaps),
             "uncalibrated_risk_score": None,
@@ -153,9 +226,9 @@ class Engine:
         self.alert_fn(finding)
         self.counts["finding"] += 1
         if self.measure_latency and self.first_alert_latency is None:
-            self.first_alert_latency = finding["time"] - network["time"]
-        observations = [read, network, *process_path[-8:]]
-        evidence_packet = packet(self.goal, finding, observations, self.coverage_gaps)
+            self.first_alert_latency = finding["time"] - effect["time"]
+        evidence_packet = packet(self.goal, finding, [*observations, *process_path[-8:]],
+                                 self.coverage_gaps)
         thread = threading.Thread(target=self._enrich, args=(finding, evidence_packet), daemon=True)
         self.threads.append(thread)
         thread.start()

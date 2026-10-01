@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 from urllib.request import Request, urlopen
 from pathlib import Path
 
@@ -88,6 +89,91 @@ class TracewardTests(unittest.TestCase):
         engine.finish()
         self.assertFalse(alerts)
         self.assertEqual(engine.summary()["finding_count"], 0)
+
+    def test_network_send_without_sensitive_read_has_distinct_finding(self):
+        engine, alerts = self._engine()
+        engine.hook({**HOOK, "command": "npm run report"})
+        parser = StraceParser("/workspace")
+        scenario = [
+            '[pid 100] 100.1 clone(child_stack=NULL, flags=SIGCHLD) = 200',
+            '[pid 200] 100.2 execve("/bin/sh", ["sh", "-lc", "npm run report"], 0x0) = 0',
+            '[pid 200] 100.9 openat(AT_FDCWD, "/usr/share/nodejs/npm/lib/auth.js", O_RDONLY) = 3</usr/share/nodejs/npm/lib/auth.js>',
+            '[pid 200] 101.0 read(0x3, 0x7ffaaa, 0x20) = 0x20',
+            '[pid 200] 101.2 connect(4<socket:[45]>, {sa_family=AF_INET, sin_port=htons(8800), sin_addr=inet_addr("127.0.0.1")}, 16) = 0',
+            '[pid 200] 101.3 sendto(0x4, 0x7ffaa, 0x10, 0, NULL, 0) = 0x10',
+        ]
+        for line in scenario:
+            event = parser.parse(line)
+            if event:
+                engine.effect(event)
+        engine.finish()
+        self.assertEqual(engine.summary()["finding_count"], 1)
+        self.assertEqual(alerts[0]["observed_effects"], ["network_send"])
+        self.assertIn("Network side effect", alerts[0]["title"])
+        self.assertGreaterEqual(len(alerts[0]["evidence_ids"]), 3)
+
+    def test_sensitive_config_write_has_distinct_finding(self):
+        engine, alerts = self._engine()
+        engine.hook({**HOOK, "command": "npm run coverage"})
+        parser = StraceParser("/workspace")
+        scenario = [
+            '[pid 100] 100.1 clone(child_stack=NULL, flags=SIGCHLD) = 200',
+            '[pid 200] 100.2 execve("/bin/sh", ["sh", "-lc", "npm run coverage"], 0x0) = 0',
+            '[pid 200] 101.0 openat(AT_FDCWD, "/workspace/synthetic-auth-config.json", O_WRONLY|O_TRUNC) = 3</workspace/synthetic-auth-config.json>',
+            '[pid 200] 101.1 write(0x3, 0x7ffaaa, 0x20) = 0x20',
+        ]
+        for line in scenario:
+            event = parser.parse(line)
+            if event:
+                engine.effect(event)
+        engine.finish()
+        self.assertEqual(engine.summary()["finding_count"], 1)
+        self.assertEqual(alerts[0]["observed_effects"], ["file_write"])
+        self.assertIn("Sensitive file modified", alerts[0]["title"])
+        self.assertIn("content was not captured", alerts[0]["message"])
+
+    def test_nested_pid_namespace_uses_tracer_visible_child_pid(self):
+        engine, alerts = self._engine()
+        engine.hook(HOOK)
+        parser = StraceParser("/workspace")
+        scenario = [
+            '[pid 100] 100.1 clone(child_stack=NULL, flags=CLONE_NEWPID|SIGCHLD) = 2 /* 200 in strace\'s PID NS */',
+            '[pid 200] 100.2 execve("/bin/sh", ["sh", "-lc", "npm test"], 0x0) = 0',
+            '[pid 200] 100.3 clone(child_stack=NULL, flags=SIGCHLD) = 13 /* 201 in strace\'s PID NS */',
+            '[pid 201] 100.4 execve("/usr/bin/node", ["node", "test.js"], 0x0) = 0',
+            *lines()[4:],
+        ]
+        for line in scenario:
+            event = parser.parse(line)
+            if event:
+                engine.effect(event)
+        engine.finish()
+        self.assertEqual(parser.parents[200], 100)
+        self.assertEqual(parser.parents[201], 200)
+        self.assertEqual(engine._tool_for(201), "tool-1")
+        self.assertEqual(engine.summary()["finding_count"], 1)
+        self.assertEqual(len(alerts), 2)
+
+    def test_worker_thread_keeps_attribution_without_inflating_process_count(self):
+        engine, _ = self._engine()
+        engine.hook(HOOK)
+        parser = StraceParser("/workspace")
+        scenario = [
+            *lines()[:2],
+            '[pid 200] 100.3 clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_THREAD) = 201',
+            '[pid 201] 101.0 openat(AT_FDCWD, "/workspace/synthetic-credential.txt", O_RDONLY) = 3</workspace/synthetic-credential.txt>',
+            '[pid 201] 101.1 read(0x3, 0x7ffaaa, 0x1000) = 0x10',
+            '[pid 201] 101.2 connect(4<socket:[45]>, {sa_family=AF_INET, sin_port=htons(8800), sin_addr=inet_addr("127.0.0.1")}, 16) = 0',
+            '[pid 201] 101.3 sendto(0x4, 0x7ffaa, 0x10, 0, NULL, 0) = 0x10',
+        ]
+        for line in scenario:
+            event = parser.parse(line)
+            if event:
+                engine.effect(event)
+        engine.finish()
+        self.assertEqual(engine._tool_for(201), "tool-1")
+        self.assertEqual(engine.summary()["finding_count"], 1)
+        self.assertEqual(engine.summary()["counts"]["process"], 2)
 
     def test_obvious_direct_action_and_legitimate_unusual_are_review_not_violation(self):
         for goal, command in (
@@ -190,7 +276,8 @@ class TracewardTests(unittest.TestCase):
         evidence = packet("Fix tests", finding, [{"event_id": "e1", "kind": "file_read",
                                                   "path": "/tmp/credential", "buffer": "SECRET"}], [])
         self.assertNotIn("SECRET", json.dumps(evidence))
-        self.assertEqual(payload(evidence)["model"], "laya-multilingual")
+        with patch.dict(os.environ, {"TRACEWARD_LAYA_MODEL": "laya-multilingual"}):
+            self.assertEqual(payload(evidence)["model"], "laya-multilingual")
         self.assertEqual(_score({"score": 0.5}), 0.125)
 
     @unittest.skipUnless(os.environ.get("TRACEWARD_TEST_OCSF_ONLINE") == "1", "opt-in official OCSF v1.8 validator")

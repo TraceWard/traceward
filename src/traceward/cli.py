@@ -17,6 +17,7 @@ from pathlib import Path
 
 from .engine import Engine
 from .ocsf import EvidenceStore
+from .privacy import redact
 from .strace import StraceParser, trace_command
 
 
@@ -29,6 +30,7 @@ def _usage() -> str:
     return (
         "usage: traceward run [--goal TEXT | --goal-file PATH] [--laya-url URL] codex [CODEX FLAGS...]\n"
         "       traceward watch RUN_ID\n"
+        "       traceward dashboard [--runs-dir PATH] [--port PORT]\n"
         "       traceward replay --goal TEXT --hooks FILE --trace FILE"
     )
 
@@ -114,6 +116,23 @@ def _safe_run_dir(run_id: str) -> Path:
     return state_root() / str(parsed)
 
 
+def _write_manifest(path: Path, run_id: str, goal: str, started_at: float) -> None:
+    """Atomically publish liveness without exposing an agent prompt or login data."""
+    item = {"run_id": run_id, "goal": redact(goal, 1000), "started_at": started_at,
+            "heartbeat_at": time.time(), "source": "codex"}
+    temporary = path.with_suffix(".tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(item, stream)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _signal_tree(tracer_pid: int, signum: int) -> None:
     """Forward an operator signal to tracees before signalling strace itself."""
     pending = [tracer_pid]
@@ -164,6 +183,8 @@ def run(args: list[str]) -> int:
     # This preserves the user's CODEX_HOME and therefore the existing login.
     cmd = ["codex", *_hook_overrides(), *codex_args]
     store = EvidenceStore(run_dir, run_id)
+    started_at = time.time()
+    _write_manifest(run_dir / "run.json", run_id, goal, started_at)
     is_interactive = sys.stdout.isatty()
 
     def alert(finding: dict) -> None:
@@ -177,6 +198,7 @@ def run(args: list[str]) -> int:
     if is_interactive:
         print(f"Live findings: traceward watch {run_id} (in another terminal)", file=sys.stderr, flush=True)
     started = time.monotonic()
+    last_heartbeat = started
     child = subprocess.Popen(trace_command(cmd, trace_file), env=env)
     trace_pos = hook_pos = 0
     trace_pending = hook_pending = ""
@@ -192,6 +214,9 @@ def run(args: list[str]) -> int:
     old_term = signal.signal(signal.SIGTERM, on_term)
     try:
         while child.poll() is None or not stopping:
+            if time.monotonic() - last_heartbeat >= 2:
+                _write_manifest(run_dir / "run.json", run_id, goal, started_at)
+                last_heartbeat = time.monotonic()
             trace_lines, trace_pos, trace_pending = _tail_lines(trace_file, trace_pos, trace_pending)
             hook_lines, hook_pos, hook_pending = _tail_lines(hook_file, hook_pos, hook_pending)
             for line in hook_lines:
@@ -283,6 +308,9 @@ def main(argv: list[str] | None = None) -> int:
             return run(args[1:])
         if args[0] == "watch" and len(args) == 2:
             return watch(args[1])
+        if args[0] == "dashboard":
+            from .dashboard import main as dashboard_main
+            return dashboard_main(args[1:])
         if args[0] == "replay":
             from .replay import replay
             return replay(args[1:])

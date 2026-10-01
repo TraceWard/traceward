@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 runs/
 *.egg-info/
+web/node_modules/
+src/traceward/dashboard_assets/

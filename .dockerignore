@@ -1,0 +1,7 @@
+.git
+.venv
+web/node_modules
+src/traceward/dashboard_assets
+__pycache__
+*.pyc
+*.egg-info

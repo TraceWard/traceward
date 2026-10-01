@@ -26,6 +26,7 @@ _FD = re.compile(r"^(?:0x)?([0-9a-fA-F]+)(?:<([^>]+)>)?")
 _IPV4 = re.compile(r'inet_addr\("([^" ]+)"\)')
 _IPV6 = re.compile(r'inet_pton\(AF_INET6, "([^" ]+)"')
 _PORT = re.compile(r"sin6?_port=htons\((\d+)\)")
+_STRACE_PID_NS = re.compile(r"/\*\s*(\d+) in strace's PID NS\s*\*/")
 
 
 def _number(value: str) -> int | None:
@@ -109,12 +110,18 @@ class StraceParser:
         common = {"time": when, "pid": pid, "syscall": name, "source": "strace",
                   "raw_trace_ref": f"raw.strace:{self.line_number}"}
         if name in {"clone", "clone3", "fork", "vfork"} and retval and retval > 0:
-            child = retval
+            # A sandbox can create a nested PID namespace. The syscall returns
+            # its namespace-local PID (often 2), while strace labels subsequent
+            # child lines with the tracer-visible PID. Use strace's decoded PID
+            # to keep ancestry in one namespace, rather than linking to PID 2.
+            decoded_pid = _STRACE_PID_NS.search(result)
+            child = int(decoded_pid.group(1)) if decoded_pid else retval
             self.parents[child] = pid
             self.fd_paths[child] = self.fd_paths[pid].copy()
             self.sockets[child] = self.sockets[pid].copy()
             self.cwd[child] = self.cwd[pid]
-            return {**common, "kind": "fork", "child_pid": child}
+            return {**common, "kind": "fork", "child_pid": child,
+                    "is_thread": "CLONE_THREAD" in args}
         if name in {"execve", "execveat"} and result.startswith("0"):
             command = _quoted(args) or "unknown"
             # The full argv is intentionally not retained; it may contain secrets.
@@ -166,6 +173,6 @@ class StraceParser:
 
 def trace_command(command: list[str], trace_file: Path) -> list[str]:
     return [
-        "strace", "-f", "-ttt", "-yy", "-s", "256", "-e", f"trace={TRACE_SYSCALLS}",
+        "strace", "-f", "--decode-pids=pidns", "-ttt", "-yy", "-s", "256", "-e", f"trace={TRACE_SYSCALLS}",
         "-e", f"raw={RAW_SYSCALLS}", "-o", str(trace_file), "--", *command,
     ]

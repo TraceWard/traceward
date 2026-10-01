@@ -28,6 +28,7 @@ def packet(goal: str, finding: dict, observations: list[dict], coverage: list[st
         "packet_version": 1,
         "authorised_goal": redact(goal, 1000),
         "finding": finding["title"],
+        "apparent_action": redact(str(finding.get("apparent_action") or ""), 512),
         "attribution": finding["attribution"],
         "evidence": allowed,
         "counterevidence": finding.get("counterevidence", []),

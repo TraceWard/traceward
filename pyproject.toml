@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "traceward"
+version = "0.1.0"
+description = "Goal-first observability PoC for Codex on Linux"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+traceward = "traceward.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/traceward"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

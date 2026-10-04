@@ -29,7 +29,9 @@ pre {
 }
 .app {
   display: flex;
-  min-height: 100vh;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
 }
 .sidebar {
   width: 276px;
@@ -38,7 +40,15 @@ pre {
   border-right: 1px solid #242d39;
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  min-height: 0;
+  overflow: hidden;
+}
+.brand,
+.side-section,
+.side-heading,
+.empty-side,
+.side-footer {
+  flex-shrink: 0;
 }
 .brand {
   height: 84px;
@@ -134,6 +144,8 @@ pre {
 .run-list {
   overflow: auto;
   flex: 1;
+  min-height: 0;
+  overscroll-behavior-y: contain;
   padding: 0 11px;
 }
 .run-card {
@@ -228,7 +240,10 @@ pre {
 }
 .main {
   min-width: 0;
+  min-height: 0;
   flex: 1;
+  overflow: auto;
+  overscroll-behavior-y: contain;
 }
 .topbar {
   height: 64px;

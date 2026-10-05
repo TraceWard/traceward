@@ -6,3 +6,8 @@ runs/
 *.egg-info/
 web/node_modules/
 src/traceward/dashboard_assets/
+.env
+.env.*
+!.env.example
+web/test-results/
+web/playwright-report/

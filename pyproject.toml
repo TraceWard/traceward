@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "traceward"
-version = "0.1.0"
-description = "Goal-first observability PoC for Codex on Linux"
+version = "0.2.0"
+description = "Goal-first observability for Codex in a managed gVisor runtime"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["protobuf==6.33.5"]
 
 [project.optional-dependencies]
 dashboard = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1"]

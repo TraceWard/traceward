@@ -37,6 +37,9 @@ def _read_json(path: Path) -> dict | None:
 
 
 def _kind(event: dict) -> str:
+    explicit = event.get("unmapped", {}).get("traceward", {}).get("event_kind")
+    if explicit:
+        return explicit
     uid = event.get("class_uid")
     activity = event.get("activity_id")
     traceward = event.get("unmapped", {}).get("traceward", {})
@@ -81,6 +84,7 @@ class RunIndex:
             );
             CREATE INDEX IF NOT EXISTS events_run_order ON events(run_id,id);
             CREATE INDEX IF NOT EXISTS events_run_kind ON events(run_id,kind,id);
+            CREATE INDEX IF NOT EXISTS events_run_time ON events(run_id,time_ms,id);
             CREATE TABLE IF NOT EXISTS findings (
               run_id TEXT NOT NULL, finding_id TEXT NOT NULL, revision INTEGER NOT NULL,
               time_s REAL, body TEXT NOT NULL,
@@ -194,10 +198,25 @@ class RunIndex:
           ORDER BY time_s DESC, revision DESC LIMIT 1""", (row["run_id"],)).fetchone()
         finding_title = (json.loads(latest_finding["body"]).get("title")
                          if latest_finding else None)
+        assessments = self.findings(row["run_id"])
+        review_count = sum(f.get("status") != "consistent_with_goal" for f in assessments)
+        if not assessments:
+            evaluation_label = "No consequential episode assessed"
+        elif any("demo" in f.get("laya", {}).get("model", "") or f.get("laya", {}).get("evaluation_source") == "simulated" for f in assessments):
+            evaluation_label = "Simulated evaluator · not Laya"
+        elif all(f.get("laya", {}).get("status") in {"scored", "assessed"} for f in assessments):
+            evaluation_label = "Model assessed"
+        elif any(f.get("laya", {}).get("status") == "unavailable" for f in assessments):
+            evaluation_label = "Model unavailable"
+        else:
+            evaluation_label = "Assessment pending"
         return {"run_id": row["run_id"], "goal": manifest.get("goal") or (summary or {}).get("goal") or "Goal unavailable",
                 "started_at": manifest.get("started_at") or row["updated_at"], "updated_at": row["updated_at"],
                 "status": status, "summary": summary, "event_counts": {r["kind"]: r["n"] for r in counts},
                 "finding_count": findings, "finding_title": finding_title,
+                "review_count": review_count, "evaluation_label": evaluation_label,
+                "source": manifest.get("source", "unknown"), "demo_case": manifest.get("demo_case"),
+                "legacy": manifest.get("observer_version") not in {"assessment-v2", "gvisor-v1"},
                 "ingest_errors": row["ingest_errors"]}
 
     def runs(self) -> list[dict]:
@@ -215,15 +234,25 @@ class RunIndex:
         with self.lock:
             query = "SELECT id,body FROM events WHERE run_id=?"
             values: list = [_run_id(run_id)]
-            for clause, value in (("id<?", before), ("kind=?", kind), ("source=?", source), ("pid=?", pid)):
+            if before is not None:
+                cursor = self.db.execute("SELECT COALESCE(time_ms,0) time_ms,id FROM events WHERE run_id=? AND id=?",
+                                         (run_id, before)).fetchone()
+                if not cursor:
+                    return {"events": [], "next_before": None}
+                query += " AND (COALESCE(time_ms,0),id)<(?,?)"
+                values.extend([cursor["time_ms"], cursor["id"]])
+            for clause, value in (("kind=?", kind), ("source=?", source), ("pid=?", pid)):
                 if value is not None:
                     query += " AND " + clause
                     values.append(value)
-            query += " ORDER BY id DESC LIMIT ?"
-            values.append(min(max(limit, 1), 500))
+            query += " ORDER BY COALESCE(time_ms,0) DESC,id DESC LIMIT ?"
+            page_size = min(max(limit, 1), 500)
+            values.append(page_size + 1)
             rows = self.db.execute(query, values).fetchall()
+            has_more = len(rows) > page_size
+            rows = rows[:page_size]
             return {"events": [{"index_id": row["id"], **json.loads(row["body"])} for row in reversed(rows)],
-                    "next_before": rows[-1]["id"] if rows else None}
+                    "next_before": rows[-1]["id"] if rows and has_more else None}
 
     def findings(self, run_id: str) -> list[dict]:
         with self.lock:
@@ -243,7 +272,7 @@ class RunIndex:
     def processes(self, run_id: str) -> list[dict]:
         with self.lock:
             rows = self.db.execute("""SELECT body FROM events WHERE run_id=? AND kind='process'
-              ORDER BY id LIMIT 5000""", (_run_id(run_id),)).fetchall()
+              ORDER BY time_ms,id LIMIT 5000""", (_run_id(run_id),)).fetchall()
             return [json.loads(row["body"]) for row in rows]
 
     def evidence(self, run_id: str, event_ids: list[str]) -> list[dict]:
@@ -252,15 +281,33 @@ class RunIndex:
         with self.lock:
             ids = event_ids[:100]
             markers = ",".join("?" for _ in ids)
-            rows = self.db.execute(f"SELECT body FROM events WHERE run_id=? AND event_id IN ({markers})",
+            rows = self.db.execute(f"SELECT body FROM events WHERE run_id=? AND event_id IN ({markers}) ORDER BY time_ms,id",
                                    [_run_id(run_id), *ids]).fetchall()
-            found = {item["metadata"]["uid"]: item for item in (json.loads(row["body"]) for row in rows)}
-            return [found[event_id] for event_id in ids if event_id in found]
+            return [json.loads(row["body"]) for row in rows]
+
+    def evaluations(self, run_id: str) -> list[dict]:
+        path = self._run_dir(run_id) / "evaluations.jsonl"
+        if path.is_symlink() or not path.is_file():
+            return []
+        result = []
+        with path.open(encoding="utf-8") as stream:
+            for line in stream:
+                if not line.endswith("\n"):
+                    break
+                try:
+                    item = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(item, dict):
+                    result.append(item)
+                if len(result) >= 500:
+                    break
+        return result
 
     def raw_excerpt(self, run_id: str, source: str, line: int, context: int = 8) -> dict:
-        if source not in {"strace", "hooks"} or line < 1:
+        if source not in {"gvisor", "strace", "hooks"} or line < 1:
             raise ValueError("invalid raw source or line")
-        path = self._run_dir(run_id) / ("raw.strace" if source == "strace" else "hooks.jsonl")
+        path = self._run_dir(run_id) / {"gvisor": "raw.gvisor.jsonl", "strace": "raw.strace", "hooks": "hooks.jsonl"}[source]
         if path.is_symlink() or not path.is_file():
             raise ValueError("raw source unavailable")
         context = min(max(context, 0), 40)
@@ -342,6 +389,12 @@ def create_app(index: RunIndex, assets: Path | None = None):
         index.refresh()
         required_run(run_id)
         return {"processes": index.processes(run_id)}
+
+    @app.get("/api/runs/{run_id}/evaluations")
+    def evaluations(run_id: str):
+        index.refresh()
+        required_run(run_id)
+        return {"evaluations": index.evaluations(run_id)}
 
     @app.get("/api/runs/{run_id}/evidence")
     def evidence(run_id: str, ids: str = ""):

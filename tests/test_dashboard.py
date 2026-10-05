@@ -88,6 +88,18 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/runs", headers={"Host": "attacker.example"}).status_code, 403)
         self.assertEqual(self.client.get("/api/runs", headers={"Origin": "https://attacker.example"}).status_code, 403)
 
+    def test_gvisor_source_and_pid_reuse_preserve_distinct_evidence(self):
+        first = self._event("first")
+        second = self._event("second")
+        first["unmapped"]["traceward"] = {"source": "gvisor", "process_key": "s:42:100", "raw_trace_ref": "raw.gvisor.jsonl:1"}
+        second["unmapped"]["traceward"] = {"source": "gvisor", "process_key": "s:42:200", "raw_trace_ref": "raw.gvisor.jsonl:2"}
+        (self.run_dir / "events.jsonl").write_text(json.dumps(first) + "\n" + json.dumps(second) + "\n")
+        (self.run_dir / "raw.gvisor.jsonl").write_text('{"metadata":"first"}\n{"metadata":"second"}\n')
+        events = self.client.get(f"/api/runs/{self.run_id}/processes").json()["processes"]
+        self.assertEqual(len(events), 2)
+        self.assertNotEqual(events[0]["unmapped"]["traceward"]["process_key"], events[1]["unmapped"]["traceward"]["process_key"])
+        self.assertEqual(self.client.get(f"/api/runs/{self.run_id}/raw?source=gvisor&line=2").status_code, 200)
+
     def test_index_restarts_and_completion_status(self):
         (self.run_dir / "events.jsonl").write_text(json.dumps(self._event("one")) + "\n")
         self.index.refresh()
@@ -97,6 +109,22 @@ class DashboardTests(unittest.TestCase):
         (self.run_dir / "summary.json").write_text(json.dumps({"goal": "Fix tests", "codex_exit_code": 0}))
         restarted.refresh()
         self.assertEqual(restarted.run(self.run_id)["status"], "complete")
+
+    def test_out_of_order_timestamps_paginate_without_duplicates_or_omissions(self):
+        items = [{**self._event(name), "time": timestamp} for name, timestamp in
+                 (("new", 103), ("old", 100), ("tie-a", 102), ("middle", 101), ("tie-b", 102))]
+        (self.run_dir / "events.jsonl").write_text("".join(json.dumps(item) + "\n" for item in items))
+        self.index.refresh()
+        page = self.index.events(self.run_id, limit=2)
+        pages = [page["events"]]
+        while page["next_before"]:
+            page = self.index.events(self.run_id, before=page["next_before"], limit=2)
+            pages.insert(0, page["events"])
+        events = [e for batch in pages for e in batch]
+        self.assertEqual([e["metadata"]["uid"] for e in events], ["old", "middle", "tie-a", "tie-b", "new"])
+        self.assertEqual([e["time"] for e in events], sorted(e["time"] for e in events))
+        evidence = self.index.evidence(self.run_id, ["new", "old", "middle"])
+        self.assertEqual([e["metadata"]["uid"] for e in evidence], ["old", "middle", "new"])
 
 
 if __name__ == "__main__":

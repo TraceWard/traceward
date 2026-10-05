@@ -1,0 +1,12 @@
+{
+  "release": "release-20260928.0",
+  "source": "https://github.com/google/gvisor/tree/release-20260928.0/pkg/sentry/seccheck/points",
+  "protobuf_python": "6.33.5",
+  "generator": "grpcio-tools 1.76.0",
+  "files": {
+    "common.proto": "c5da98607aafb974344bdd5110b3899ab50e4a074a9a9617239cc76c2417a1e7",
+    "container.proto": "6ca8103090f76706df54abf64e6d11d3a6fef150be9da21749adffe7a6e35d29",
+    "sentry.proto": "bb7fb301e0ded3939be5074c798f36ccf118758206b5747e26daddef5fbaecdf",
+    "syscall.proto": "18d6540f4e04a4d8e7f24e17e24ad4b407b16f50f33188f872ce8881ff1a7ec7"
+  }
+}

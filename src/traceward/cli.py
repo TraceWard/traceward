@@ -4,21 +4,19 @@ from __future__ import annotations
 
 import json
 import os
-import platform
-import shlex
-import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from pathlib import Path
 
 from .engine import Engine
+from .config import load_observer_env
 from .ocsf import EvidenceStore
 from .privacy import redact
-from .strace import StraceParser, trace_command
+from .gvisor import GvisorParser
+from .runtime import ManagedRuntime
 
 
 def state_root() -> Path:
@@ -28,32 +26,45 @@ def state_root() -> Path:
 
 def _usage() -> str:
     return (
-        "usage: traceward run [--goal TEXT | --goal-file PATH] [--laya-url URL] codex [CODEX FLAGS...]\n"
+        "usage: traceward run [--goal TEXT | --goal-file PATH] [--judge-provider lmstudio|laya] [--judge-url URL] [--judge-model MODEL] [--laya-url URL] [--runner-image IMAGE] [--workspace PATH] [--guest-image IMAGE] codex [CODEX FLAGS...]\n"
         "       traceward watch RUN_ID\n"
         "       traceward dashboard [--runs-dir PATH] [--port PORT]\n"
         "       traceward replay --goal TEXT --hooks FILE --trace FILE"
     )
 
 
-def _parse_run(args: list[str]) -> tuple[str, str | None, list[str]]:
-    goal = goal_file = laya_url = None
+def _parse_run(args: list[str]) -> tuple[str, str | None, list[str], str | None, str | None, str | None, dict]:
+    goal = goal_file = laya_url = image = workspace = guest_image = None
+    judge_options = {}
     index = 0
     while index < len(args) and args[index] != "codex":
         flag = args[index]
-        if flag not in {"--goal", "--goal-file", "--laya-url"} or index + 1 >= len(args):
+        if flag not in {"--goal", "--goal-file", "--laya-url", "--runner-image", "--workspace", "--guest-image", "--judge-provider", "--judge-url", "--judge-model"} or index + 1 >= len(args):
             raise ValueError(_usage())
         value = args[index + 1]
         if flag == "--goal":
             goal = value
         elif flag == "--goal-file":
             goal_file = value
-        else:
+        elif flag == "--laya-url":
             laya_url = value
+        elif flag == "--runner-image":
+            image = value
+        elif flag == "--workspace":
+            workspace = value
+        elif flag.startswith('--judge-'):
+            judge_options[flag.removeprefix('--judge-')] = value
+        else:
+            guest_image = value
         index += 2
     if index >= len(args) or args[index] != "codex":
         raise ValueError(_usage())
     if goal and goal_file:
         raise ValueError("choose --goal or --goal-file, not both")
+    if laya_url and judge_options:
+        raise ValueError('choose --laya-url or --judge-* options')
+    if judge_options.get('provider', 'lmstudio') not in {'lmstudio', 'laya'}:
+        raise ValueError('judge provider must be lmstudio or laya')
     if goal_file:
         goal = Path(goal_file).read_text(encoding="utf-8").strip()
     if not goal:
@@ -63,23 +74,7 @@ def _parse_run(args: list[str]) -> tuple[str, str | None, list[str]]:
             raise ValueError("a non-interactive run requires --goal or --goal-file")
     if not goal:
         raise ValueError("goal cannot be empty")
-    return goal, laya_url, args[index + 1:]
-
-
-def _toml_string(value: str) -> str:
-    return json.dumps(value)
-
-
-def _hook_overrides() -> list[str]:
-    package_root = str(Path(__file__).resolve().parents[1])
-    hook_path = package_root + os.pathsep + os.environ.get("PYTHONPATH", "")
-    command = f"PYTHONPATH={shlex.quote(hook_path)} {shlex.quote(sys.executable)} -m traceward.hook_sink"
-    handler = f'{{type="command",command={_toml_string(command)},timeout=5}}'
-    return [
-        "-c", f"hooks.SessionStart=[{{hooks=[{handler}]}}]",
-        "-c", f'hooks.PreToolUse=[{{matcher="Bash|apply_patch",hooks=[{handler}]}}]',
-        "-c", f'hooks.PostToolUse=[{{matcher="Bash|apply_patch",hooks=[{handler}]}}]',
-    ]
+    return goal, laya_url, args[index + 1:], image, workspace, guest_image, judge_options
 
 
 def _tail_lines(path: Path, offset: int, pending: str) -> tuple[list[str], int, str]:
@@ -94,20 +89,6 @@ def _tail_lines(path: Path, offset: int, pending: str) -> tuple[list[str], int, 
     return parts[:-1], offset, parts[-1]
 
 
-def _preflight() -> None:
-    if platform.system() != "Linux":
-        raise RuntimeError("the PoC runtime sensor supports Linux only; no Codex process was started")
-    if not shutil.which("strace"):
-        raise RuntimeError("strace is required on Linux; no Codex process was started")
-    if not shutil.which("codex"):
-        raise RuntimeError("codex is not on PATH; no agent process was started")
-    with tempfile.TemporaryDirectory(prefix="traceward-preflight-") as tmp:
-        trace = Path(tmp) / "trace.log"
-        probe = subprocess.run(trace_command(["/bin/true"], trace), capture_output=True, text=True)
-        if probe.returncode or not trace.exists() or "execve" not in trace.read_text(errors="replace"):
-            raise RuntimeError("strace cannot follow a child here; check ptrace/seccomp settings")
-
-
 def _safe_run_dir(run_id: str) -> Path:
     try:
         parsed = uuid.UUID(run_id)
@@ -119,7 +100,10 @@ def _safe_run_dir(run_id: str) -> Path:
 def _write_manifest(path: Path, run_id: str, goal: str, started_at: float) -> None:
     """Atomically publish liveness without exposing an agent prompt or login data."""
     item = {"run_id": run_id, "goal": redact(goal, 1000), "started_at": started_at,
-            "heartbeat_at": time.time(), "source": "codex"}
+            "heartbeat_at": time.time(),
+            "source": "scripted_agent" if os.environ.get("TRACEWARD_DEMO_CASE") else "codex",
+            "demo_case": os.environ.get("TRACEWARD_REAL_CASE") or os.environ.get("TRACEWARD_DEMO_CASE"),
+            "observer_version": "gvisor-v1", "runtime": "gvisor"}
     temporary = path.with_suffix(".tmp")
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
@@ -133,146 +117,109 @@ def _write_manifest(path: Path, run_id: str, goal: str, started_at: float) -> No
         temporary.unlink(missing_ok=True)
 
 
-def _signal_tree(tracer_pid: int, signum: int) -> None:
-    """Forward an operator signal to tracees before signalling strace itself."""
-    pending = [tracer_pid]
-    descendants: list[int] = []
-    seen: set[int] = set()
-    while pending:
-        pid = pending.pop()
-        if pid in seen:
-            continue
-        seen.add(pid)
-        children_file = Path(f"/proc/{pid}/task/{pid}/children")
-        try:
-            children = [int(value) for value in children_file.read_text().split()]
-        except (OSError, ValueError):
-            continue
-        descendants.extend(children)
-        pending.extend(children)
-    for pid in reversed(descendants):
-        try:
-            os.kill(pid, signum)
-        except ProcessLookupError:
-            pass
-    try:
-        os.kill(tracer_pid, signum)
-    except ProcessLookupError:
-        pass
-
-
 def run(args: list[str]) -> int:
-    goal, laya_url, codex_args = _parse_run(args)
-    _preflight()
+    goal, laya_url, codex_args, image, workspace, guest_image, judge_options = _parse_run(args)
     run_id = str(uuid.uuid4())
     run_dir = _safe_run_dir(run_id)
     run_dir.mkdir(parents=True, mode=0o700)
     run_dir.chmod(0o700)
-    hook_file = run_dir / "hooks.jsonl"
-    trace_file = run_dir / "raw.strace"
+    hook_file, trace_file = run_dir / "hooks.jsonl", run_dir / "raw.gvisor.jsonl"
     for file in (hook_file, trace_file):
         file.touch(mode=0o600)
         file.chmod(0o600)
-    env = os.environ.copy()
-    # The model endpoint credential belongs to the observer, not the agent.
-    env.pop("UNSLOTH_TOKEN", None)
-    env["TRACEWARD_RUN_ID"] = run_id
-    env["TRACEWARD_HOOK_FILE"] = str(hook_file)
-    if laya_url:
-        env["TRACEWARD_LAYA_URL"] = laya_url
-    # This preserves the user's CODEX_HOME and therefore the existing login.
-    cmd = ["codex", *_hook_overrides(), *codex_args]
-    store = EvidenceStore(run_dir, run_id)
     started_at = time.time()
     _write_manifest(run_dir / "run.json", run_id, goal, started_at)
-    is_interactive = sys.stdout.isatty()
-
-    def alert(finding: dict) -> None:
-        if not is_interactive:
+    try:
+        runtime = ManagedRuntime(run_dir, run_id, codex_args, image=image,
+                                 workspace=workspace, guest_image=guest_image)
+    except Exception:
+        path = run_dir / "summary.json"
+        path.write_text(json.dumps({"run_id": run_id, "goal": redact(goal, 1000),
+                                    "codex_exit_code": None, "finding_count": 0,
+                                    "coverage_gaps": ["runtime setup failed; no agent task started"]}))
+        path.chmod(0o600)
+        raise
+    store = EvidenceStore(run_dir, run_id)
+    interactive = sys.stdout.isatty()
+    def alert(finding: dict):
+        if not interactive:
             print(f"[TraceWard] finding {finding['finding_id']} r{finding['revision']}: "
-                  f"{finding['title']}", file=sys.stderr, flush=True)
-
-    engine = Engine(goal, store, alert_fn=alert)
-    parser = StraceParser(os.getcwd())
+                  f"{finding['status']} — {finding['title']}", file=sys.stderr, flush=True)
+    from .judges import judge
+    engine = Engine(goal, store, alert_fn=alert, coverage_gaps=[],
+                    judge_fn=lambda evidence: judge(evidence, laya_url=laya_url, **judge_options))
+    for gap in runtime.gaps:
+        engine.add_gap(gap)
+    parser = GvisorParser(os.getcwd(), runtime.metadata.get("abi", "arm64"))
     print(f"TraceWard run {run_id} — evidence: {run_dir}", file=sys.stderr, flush=True)
-    if is_interactive:
-        print(f"Live findings: traceward watch {run_id} (in another terminal)", file=sys.stderr, flush=True)
-    started = time.monotonic()
-    last_heartbeat = started
-    child = subprocess.Popen(trace_command(cmd, trace_file), env=env)
+    print("Runtime: managed gVisor (Linux guest)", file=sys.stderr, flush=True)
+    if interactive:
+        print(f"Live findings: traceward watch {run_id}", file=sys.stderr, flush=True)
+    started = last_heartbeat = time.monotonic()
     trace_pos = hook_pos = 0
     trace_pending = hook_pending = ""
     warned_hooks = False
-    stopping = False
-
-    def on_term(signum: int, _frame: object) -> None:
-        nonlocal stopping
-        stopping = True
-        if child.poll() is None:
-            _signal_tree(child.pid, signum)
-
-    old_term = signal.signal(signal.SIGTERM, on_term)
+    child = None
+    def forward(signum, _frame):
+        if child and child.poll() is None:
+            runtime.signal(child, signum)
+    previous = {s: signal.signal(s, forward) for s in (signal.SIGTERM, signal.SIGINT)}
+    def drain():
+        nonlocal trace_pos, hook_pos, trace_pending, hook_pending
+        trace_lines, trace_pos, trace_pending = _tail_lines(trace_file, trace_pos, trace_pending)
+        hook_lines, hook_pos, hook_pending = _tail_lines(hook_file, hook_pos, hook_pending)
+        for line in hook_lines:
+            try:
+                item = json.loads(line)
+                if item.get("run_id") == run_id:
+                    engine.hook(item)
+            except (ValueError, TypeError):
+                engine.add_gap("malformed hook record")
+        for line in trace_lines:
+            effect = parser.parse(line)
+            if effect:
+                engine.effect(effect)
+        for gap in parser.gaps:
+            engine.add_gap(gap)
     try:
-        while child.poll() is None or not stopping:
+        child = subprocess.Popen(runtime.command)
+        while child.poll() is None:
             if time.monotonic() - last_heartbeat >= 2:
                 _write_manifest(run_dir / "run.json", run_id, goal, started_at)
                 last_heartbeat = time.monotonic()
-            trace_lines, trace_pos, trace_pending = _tail_lines(trace_file, trace_pos, trace_pending)
-            hook_lines, hook_pos, hook_pending = _tail_lines(hook_file, hook_pos, hook_pending)
-            for line in hook_lines:
-                try:
-                    item = json.loads(line)
-                except ValueError:
-                    engine.add_gap("malformed hook record")
-                    continue
-                if item.get("run_id") == run_id:
-                    engine.hook(item)
-            for line in trace_lines:
-                effect = parser.parse(line)
-                if effect:
-                    engine.effect(effect)
-            if child.poll() is not None:
-                break
+            drain()
             if not warned_hooks and time.monotonic() - started > 15 and not engine.counts.get("hook"):
                 warned_hooks = True
-                print("TraceWard warning: no Codex hook has fired; check hook trust with /hooks. "
-                      "Combined coverage is not yet established.", file=sys.stderr, flush=True)
+                print("TraceWard: no Codex hook received; review hook trust via /hooks. "
+                      "Combined coverage is not established.", file=sys.stderr, flush=True)
             time.sleep(0.1)
-        # Allow final hook/trace writes to drain after the child exits.
+        exit_code = child.wait()
         for _ in range(5):
-            trace_lines, trace_pos, trace_pending = _tail_lines(trace_file, trace_pos, trace_pending)
-            hook_lines, hook_pos, hook_pending = _tail_lines(hook_file, hook_pos, hook_pending)
-            for line in hook_lines:
-                try:
-                    item = json.loads(line)
-                    if item.get("run_id") == run_id:
-                        engine.hook(item)
-                except ValueError:
-                    engine.add_gap("malformed hook record")
-            for line in trace_lines:
-                effect = parser.parse(line)
-                if effect:
-                    engine.effect(effect)
+            drain()
             time.sleep(0.05)
-    except KeyboardInterrupt:
-        if child.poll() is None:
-            _signal_tree(child.pid, signal.SIGINT)
     finally:
-        signal.signal(signal.SIGTERM, old_term)
-    exit_code = child.wait()
+        for s, handler in previous.items():
+            signal.signal(s, handler)
+        runtime.cleanup()
+    status_path = run_dir / "runtime-status.json"
+    status = json.loads(status_path.read_text()) if status_path.exists() else {}
+    if not status.get("handshakes") or not status.get("source_messages"):
+        engine.add_gap("gVisor telemetry was not established; run coverage is incomplete")
+    if status.get("collector_failed") or status.get("decode_errors") or status.get("collector_dropped_messages"):
+        engine.add_gap("collector failure or rejected/dropped messages; run coverage is incomplete")
     if parser.unparsed:
-        engine.add_gap(f"{parser.unparsed} strace lines were not parsed")
+        engine.add_gap(f"{parser.unparsed} gVisor records could not be normalized")
     engine.finish()
-    summary = engine.summary()
-    summary.update({"run_id": run_id, "codex_exit_code": exit_code,
-                    "wall_seconds": round(time.monotonic() - started, 3),
-                    "unparsed_strace_lines": parser.unparsed,
-                    "source_event_loss": "unknown; strace text has no loss counter",
-                    "runtime_overhead": "not measured without a comparable untraced Codex run"})
-    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    (run_dir / "summary.json").chmod(0o600)
+    summary = {**engine.summary(), **runtime.metadata, **status,
+               "run_id": run_id, "codex_exit_code": exit_code,
+               "wall_seconds": round(time.monotonic() - started, 3),
+               "unparsed_runtime_records": parser.unparsed,
+               "runtime_overhead": "see separate comparable-run measurements"}
+    path = run_dir / "summary.json"
+    path.write_text(json.dumps(summary, indent=2) + "\n")
+    path.chmod(0o600)
     print(f"TraceWard: {summary['finding_count']} finding(s), {len(summary['coverage_gaps'])} coverage gap(s). "
-          f"Summary: {run_dir / 'summary.json'}", file=sys.stderr, flush=True)
+          f"Summary: {path}", file=sys.stderr, flush=True)
     return exit_code if exit_code >= 0 else 128 - exit_code
 
 
@@ -292,7 +239,9 @@ def watch(run_id: str) -> int:
             print(f"{item['time']:.3f} r{item['revision']} {item['finding_id']} {item['title']}")
             print(f"  {item['message']}")
             if item.get("uncalibrated_risk_score") is not None:
-                print(f"  Laya uncalibrated risk score: {item['uncalibrated_risk_score']}")
+                print(f"  Model uncalibrated risk score: {item['uncalibrated_risk_score']}")
+            if item.get('laya', {}).get('rationale'):
+                print(f"  Model: {item['laya'].get('model')} — {item['laya']['rationale']}")
         if (run_dir / "summary.json").exists():
             return 0
         time.sleep(0.2)
@@ -301,6 +250,7 @@ def watch(run_id: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     try:
+        load_observer_env()
         if not args or args[0] in {"-h", "--help"}:
             print(_usage())
             return 0

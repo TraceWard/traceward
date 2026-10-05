@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type Summary = {
   coverage_gaps?: string[];
@@ -16,6 +16,11 @@ type Run = {
   summary: Summary | null;
   event_counts: Record<string, number>;
   finding_count: number;
+  review_count?: number;
+  evaluation_label?: string;
+  source?: string;
+  demo_case?: string;
+  legacy?: boolean;
   finding_title?: string | null;
   ingest_errors: number;
 };
@@ -40,12 +45,19 @@ type Event = {
       source?: string;
       event_id?: string;
       pid?: number;
+      event_kind?: string;
+      process_key?: string;
+      parent_process_key?: string;
       raw_trace_ref?: string;
       hook_event?: string;
       apparent_command?: string;
       tool_use_id?: string;
       endpoint?: string;
       byte_count?: number;
+      operation_status?: string;
+      errno?: number;
+      result?: number;
+      exit_status?: number;
     };
   };
 };
@@ -63,11 +75,16 @@ type Finding = {
   counterevidence: string[];
   coverage_gaps: string[];
   uncalibrated_risk_score: number | null;
+  assessment_note?: string;
   laya?: {
     status: string;
     reason?: string;
     model?: string;
+    semantic_accuracy_validated?: boolean;
     dimensions?: Record<string, number>;
+    disposition?: string;
+    rationale?: string;
+    cited_evidence_ids?: string[];
   };
   revisions: Finding[];
 };
@@ -77,6 +94,7 @@ const short = (value: string, size = 8) => value?.slice(0, size) || "—";
 const date = (value?: number, millis = false) =>
   value ? new Date(value * (millis ? 1 : 1000)).toLocaleString() : "—";
 const kind = (event: Event) => {
+  if (event.unmapped?.traceward?.event_kind) return event.unmapped.traceward.event_kind;
   if (event.class_uid === 0)
     return event.unmapped?.traceward?.hook_event ? "hook" : "coverage";
   if (event.class_uid === 1001)
@@ -93,14 +111,15 @@ const kind = (event: Event) => {
 };
 const eventTitle = (event: Event) => {
   const meta = event.unmapped?.traceward;
+  const outcome = meta?.operation_status === "failed" ? "Failed attempt · " : meta?.operation_status === "pending" ? "Pending connection · " : "";
   if (kind(event) === "hook")
     return `${meta?.hook_event || "Hook"} · ${meta?.apparent_command || "tool call"}`;
   if (kind(event) === "process")
     return event.process?.cmd_line || event.process?.name || "Process launched";
   if (kind(event).startsWith("file"))
-    return event.file?.path || "File operation";
+    return outcome + (event.file?.path || "File operation");
   if (kind(event).startsWith("network"))
-    return (
+    return outcome + (
       meta?.endpoint ||
       `${event.dst_endpoint?.domain || event.dst_endpoint?.ip || "Network"}:${event.dst_endpoint?.port || ""}`
     );
@@ -144,6 +163,11 @@ export default function App() {
   const [error, setError] = useState("");
   const [raw, setRaw] = useState<Raw | null>(null);
   const [older, setOlder] = useState<number | null>(null);
+  const [evaluations, setEvaluations] = useState<{finding_id: string; revision: number; packet: unknown; judgement: unknown}[]>([]);
+  const [loadedRun, setLoadedRun] = useState("");
+  const activeRun = useRef(runId);
+  const paginationStarted = useRef(false);
+  activeRun.current = runId;
 
   const loadRuns = useCallback(async () => {
     try {
@@ -158,17 +182,24 @@ export default function App() {
   const loadRun = useCallback(async () => {
     if (!runId) return;
     try {
-      const [eventData, findingData, processData] = await Promise.all([
+      const [eventData, findingData, processData, evaluationData] = await Promise.all([
         get<{ events: Event[]; next_before: number | null }>(
           `/api/runs/${runId}/events?limit=250`,
         ),
         get<{ findings: Finding[] }>(`/api/runs/${runId}/findings`),
         get<{ processes: Event[] }>(`/api/runs/${runId}/processes`),
+        get<{ evaluations: typeof evaluations }>(`/api/runs/${runId}/evaluations`),
       ]);
-      setEvents(eventData.events);
+      if (activeRun.current !== runId) return;
+      setEvents(current => {
+        const merged = new Map([...current, ...eventData.events].map(e => [e.metadata.uid, e]));
+        return [...merged.values()].sort((a, b) => a.time - b.time || (a.index_id || 0) - (b.index_id || 0));
+      });
       setProcesses(processData.processes);
-      setOlder(eventData.next_before);
+      setOlder(current => paginationStarted.current ? current : eventData.next_before);
       setFindings(findingData.findings);
+      setEvaluations(evaluationData.evaluations);
+      setLoadedRun(runId);
       setSelectedFinding((current) =>
         current && findingData.findings.some((f) => f.finding_id === current)
           ? current
@@ -185,8 +216,9 @@ export default function App() {
     stream.onmessage = () => {
       void loadRuns();
     };
-    stream.onerror = () => setError("Live connection interrupted; retrying…");
-    return () => stream.close();
+    // Embedded browsers/proxies may buffer SSE. Polling is an independent fallback.
+    const timer = window.setInterval(() => void loadRuns(), 2000);
+    return () => { stream.close(); window.clearInterval(timer); };
   }, [loadRuns]);
   useEffect(() => {
     setEvents([]);
@@ -195,6 +227,8 @@ export default function App() {
     setSelectedEvent(null);
     setSelectedFinding("");
     setEvidence([]);
+    setOlder(null);
+    paginationStarted.current = false;
     void loadRun();
   }, [runId, loadRun]);
   useEffect(() => {
@@ -202,7 +236,8 @@ export default function App() {
     stream.onmessage = () => {
       void loadRun();
     };
-    return () => stream.close();
+    const timer = window.setInterval(() => void loadRun(), 2000);
+    return () => { stream.close(); window.clearInterval(timer); };
   }, [loadRun]);
   const run = runs.find((item) => item.run_id === runId);
   const finding = findings.find((item) => item.finding_id === selectedFinding);
@@ -211,11 +246,13 @@ export default function App() {
       setEvidence([]);
       return;
     }
+    let cancelled = false;
     void get<{ events: Event[] }>(
       `/api/runs/${runId}/evidence?ids=${encodeURIComponent(finding.evidence_ids.join(","))}`,
     )
-      .then((data) => setEvidence(data.events))
-      .catch(() => setEvidence([]));
+      .then((data) => { if (!cancelled) setEvidence(data.events); })
+      .catch(() => { if (!cancelled) setEvidence([]); });
+    return () => { cancelled = true; };
   }, [runId, finding?.finding_id, finding?.revision]);
   const shown = useMemo(
     () =>
@@ -234,16 +271,16 @@ export default function App() {
     [events, evidence, finding, filter, view],
   );
   const processDepths = useMemo(() => {
-    const parents = new Map<number, number>();
+    const parents = new Map<string | number, string | number>();
     for (const event of processes) {
-      const pid = event.process?.pid;
-      const parent = event.process?.parent_process?.pid;
+      const pid = event.unmapped?.traceward?.process_key || event.process?.pid;
+      const parent = event.unmapped?.traceward?.parent_process_key || event.process?.parent_process?.pid;
       if (pid && parent) parents.set(pid, parent);
     }
-    const depth = (pid: number) => {
+    const depth = (pid: string | number) => {
       let current = pid;
       let level = 0;
-      const seen = new Set<number>();
+      const seen = new Set<string | number>();
       while (parents.has(current) && !seen.has(current) && level < 8) {
         seen.add(current);
         current = parents.get(current)!;
@@ -251,21 +288,26 @@ export default function App() {
       }
       return level;
     };
-    return new Map(processes.map((event) => [event.metadata.uid, depth(event.process?.pid || 0)]));
+    return new Map(processes.map((event) => [event.metadata.uid, depth(event.unmapped?.traceward?.process_key || event.process?.pid || 0)]));
   }, [processes]);
   const total = Object.values(run?.event_counts || {}).reduce(
     (a, b) => a + b,
     0,
   );
   const rawRef = selectedEvent?.unmapped?.traceward?.raw_trace_ref;
-  const rawLine = rawRef && /^raw\.strace:(\d+)$/.exec(rawRef)?.[1];
+  const rawMatch = rawRef && /^raw\.(strace|gvisor\.jsonl):(\d+)$/.exec(rawRef);
+  const rawLine = rawMatch && rawMatch[2];
+  const rawSource = rawMatch && (rawMatch[1] === "strace" ? "strace" : "gvisor");
 
   async function loadOlder() {
     if (!older || !runId) return;
+    paginationStarted.current = true;
     const result = await get<{ events: Event[]; next_before: number | null }>(
       `/api/runs/${runId}/events?limit=250&before=${older}`,
     );
-    setEvents((current) => [...result.events, ...current]);
+    if (activeRun.current !== runId) return;
+    setEvents((current) => [...new Map([...result.events, ...current].map(e => [e.metadata.uid, e])).values()]
+      .sort((a, b) => a.time - b.time || (a.index_id || 0) - (b.index_id || 0)));
     setOlder(result.next_before);
   }
   async function openRaw(source: string, line: number) {
@@ -307,6 +349,7 @@ export default function App() {
           {runs.map((item) => (
             <button
               key={item.run_id}
+              data-run-id={item.run_id}
               className={`run-card ${item.run_id === runId ? "selected" : ""}`}
               onClick={() => setRunId(item.run_id)}
             >
@@ -328,6 +371,7 @@ export default function App() {
               <small>
                 {short(item.run_id, 14)} · {item.status}
               </small>
+              <small>{item.legacy ? "Historical run · " : `${item.source} · `}{item.evaluation_label}</small>
             </button>
           ))}
         </div>
@@ -394,6 +438,7 @@ export default function App() {
               <div>
                 <div className="eyebrow">AUTHORISED GOAL</div>
                 <p>{run.goal}</p>
+                <small>{run.source} {run.demo_case && `· ${run.demo_case}`} · {run.evaluation_label}{run.legacy && " · historical results were not revalidated"}</small>
               </div>
             </section>
             <div className="metrics">
@@ -416,13 +461,13 @@ export default function App() {
                 <small>Confirmed reads / writes</small>
               </div>
               <div className={`metric ${run.finding_count ? "highlight" : ""}`}>
-                <span>REVIEW FINDINGS</span>
+                <span>OBSERVED EPISODES</span>
                 <strong>{run.finding_count}</strong>
-                <small>Not confirmed violations</small>
+                <small>{run.review_count ?? run.finding_count} pending / review / inconclusive</small>
               </div>
             </div>
             <div className="workspace-grid">
-              <section className="trace-panel">
+              <section className="trace-panel" data-loaded-events={events.length}>
                 <div className="panel-head">
                   <div>
                     <div className="eyebrow">OBSERVABILITY</div>
@@ -493,6 +538,9 @@ export default function App() {
                     {shown.map((event) => (
                       <button
                         key={event.metadata.uid}
+                        data-event-id={event.metadata.uid}
+                        data-kind={kind(event)}
+                        data-time={event.time}
                         className={`event-row ${selectedEvent?.metadata.uid === event.metadata.uid ? "picked" : ""}`}
                         onClick={() => {
                           setSelectedEvent(event);
@@ -511,7 +559,7 @@ export default function App() {
                             {eventPid(event) ? `· PID ${eventPid(event)}` : ""}
                           </span>
                         </span>
-                        <time>{date(event.time, true).split(", ").pop()}</time>
+                        <time>{new Date(event.time).toLocaleTimeString(undefined, {hour: "2-digit", minute: "2-digit", second: "2-digit", fractionalSecondDigits: 3})}</time>
                       </button>
                     ))}
                     {!shown.length && (
@@ -522,10 +570,10 @@ export default function App() {
                   </div>
                 ) : (
                   <div className="process-list">
-                    {processes.map((event) => (
+                    {(view === "hooks" ? [] : processes).map((event) => (
                       <button
                         key={event.metadata.uid}
-                        style={{ paddingLeft: `${20 + (processDepths.get(event.metadata.uid) || 0) * 15}px` }}
+                        data-depth={processDepths.get(event.metadata.uid) || 0}
                         onClick={() => {
                           setSelectedEvent(event);
                         }}
@@ -540,7 +588,7 @@ export default function App() {
                         </span>
                       </button>
                     ))}
-                    {!processes.length && (
+                    {(!processes.length || view === "hooks") && (
                       <div className="empty-list">No process evidence yet.</div>
                     )}
                   </div>
@@ -600,10 +648,13 @@ export default function App() {
                         </code>
                       </div>
                     )}
+                    {selectedEvent.unmapped?.traceward?.operation_status && <div className="detail-pair"><span>Operation outcome</span><b>{selectedEvent.unmapped.traceward.operation_status}{selectedEvent.unmapped.traceward.errno ? ` · errno ${selectedEvent.unmapped.traceward.errno}` : ""}</b></div>}
+                    {selectedEvent.unmapped?.traceward?.byte_count !== undefined && <div className="detail-pair"><span>Observed bytes</span><b>{selectedEvent.unmapped.traceward.byte_count}</b></div>}
+                    {selectedEvent.unmapped?.traceward?.process_key && <div className="detail-pair"><span>Process identity</span><code>{selectedEvent.unmapped.traceward.process_key}</code></div>}
                     {rawLine && (
                       <button
                         className="raw-button"
-                        onClick={() => void openRaw("strace", Number(rawLine))}
+                        onClick={() => void openRaw(rawSource || "gvisor", Number(rawLine))}
                       >
                         View raw trace excerpt ↗
                       </button>
@@ -642,9 +693,9 @@ export default function App() {
                         </div>
                         {finding && (
                           <>
-                            <div className="finding-alert">
+                            <div className="finding-alert" data-status={finding.status} data-revision={finding.revision}>
                               <span className="finding-badge">
-                                REVIEW REQUIRED
+                                {(finding.status === "suspicious_behaviour" ? "legacy provisional alert" : finding.status).replaceAll("_", " ").toUpperCase()}
                               </span>
                               <h3>{finding.title}</h3>
                               <p>{finding.message}</p>
@@ -653,12 +704,27 @@ export default function App() {
                                 {finding.observed_effects.join(" + ")}
                               </small>
                             </div>
+                            {finding.assessment_note && <p>{finding.assessment_note}</p>}
                             <div className="section-label">
                               DECISION MODEL · {finding.laya?.status === "unavailable"
                                 ? "UNAVAILABLE"
                                 : finding.laya?.model || "PENDING"}
                             </div>
-                            {finding.laya?.status === "scored" ? (
+                            {finding.laya?.status === "assessed" ? (
+                              <div className="score-card structured-assessment">
+                                <div className="score-top">
+                                  <div><span>MODEL VERDICT</span><strong>{finding.laya.disposition?.replaceAll("_", " ")}</strong></div>
+                                  <span className="score-tag">{finding.laya.model?.includes("demo") ? "SIMULATED EVALUATOR" : "STRUCTURED MODEL REVIEW"}</span>
+                                </div>
+                                <p className="judge-rationale">{finding.laya.rationale}</p>
+                                <div className="judge-citations">{finding.laya.cited_evidence_ids?.map(id => {
+                                  const item = evidence.find(e => e.metadata.uid === id);
+                                  return <button key={id} disabled={!item} onClick={() => item && setSelectedEvent(item)} aria-label={`Judge evidence ${id}`}>{short(id, 16)}</button>;
+                                })}</div>
+                                <p>No numerical risk score. This verdict is not a confirmed violation or proof of safety.</p>
+                                <p>Experimental judgement: validation covers reviewed cases; production accuracy is not established.</p>
+                              </div>
+                            ) : finding.laya?.status === "scored" ? (
                               <div className="score-card">
                                 <div className="score-top">
                                   <div>
@@ -684,11 +750,7 @@ export default function App() {
                                         <span>{key.replaceAll("_", " ")}</span>
                                         <b>{Math.round(value * 100)}%</b>
                                       </div>
-                                      <i>
-                                        <em
-                                          style={{ width: `${value * 100}%` }}
-                                        />
-                                      </i>
+                                      <progress className="score-progress" value={value} max={1} />
                                     </div>
                                   ))}
                                 </div>
@@ -696,12 +758,16 @@ export default function App() {
                                   This score is not a probability of
                                   misalignment or a confirmed violation.
                                 </p>
+                                {finding.laya.semantic_accuracy_validated === false && (
+                                  <p>Experimental judgement: semantic accuracy is not validated. The current Laya checkpoint has a known authorised-control false positive.</p>
+                                )}
+                                {run.legacy && <p>Historical assessment: limited context and simulated scores have not been revalidated.</p>}
                               </div>
                             ) : (
                               <div className="model-unavailable">
                                 {finding.laya
                                   ? `Judgement unavailable (${finding.laya.reason || "no score"}).`
-                                  : "Provisional finding. Waiting for Laya…"}{" "}
+                                  : "Provisional finding. Waiting for the decision model…"}{" "}
                                 The observed evidence remains available.
                               </div>
                             )}
@@ -709,6 +775,12 @@ export default function App() {
                               CAUSAL EVIDENCE · {finding.evidence_ids.length}{" "}
                               IDS
                             </div>
+                            <div className="section-label">COUNTEREVIDENCE & LIMITS</div>
+                            <ul className="gaps">{finding.counterevidence.map((item, index) => <li key={index}>{item}</li>)}</ul>
+                            <details>
+                              <summary>Inspect exact evaluation packet and typed response</summary>
+                              <pre className="evaluation-json">{evaluations.some(item => item.finding_id === finding.finding_id) ? JSON.stringify(evaluations.filter(item => item.finding_id === finding.finding_id), null, 2) : "No audit packet recorded for this historical assessment."}</pre>
+                            </details>
                             <div className="evidence-chain">
                               {finding.evidence_ids.map((id, index) => {
                                 const item = evidence.find(
@@ -750,25 +822,25 @@ export default function App() {
                                 <div key={item.revision}>
                                   <b>r{item.revision}</b>
                                   <span>
-                                    {item.laya?.status === "scored"
+                                    {item.laya?.status === "assessed" ? "Structured model assessment" : item.laya?.status === "scored"
                                       ? item.laya.model?.includes("demo")
                                         ? "Simulated evaluator"
-                                        : "Laya evaluation"
+                                        : "Model evaluation"
                                       : item.laya
-                                        ? "Laya unavailable"
+                                        ? "Model unavailable"
                                         : "Provisional evidence finding"}
                                   </span>
                                   <time>{date(item.time)}</time>
                                 </div>
                               ))}
                             </div>
-                            {finding.coverage_gaps?.length > 0 && (
+                            {[...new Set([...(finding.coverage_gaps || []), ...(run.summary?.coverage_gaps || [])])].length > 0 && (
                               <>
                                 <div className="section-label">
                                   COVERAGE GAPS
                                 </div>
                                 <ul className="gaps">
-                                  {finding.coverage_gaps.map((gap) => (
+                                  {[...new Set([...(finding.coverage_gaps || []), ...(run.summary?.coverage_gaps || [])])].map((gap) => (
                                     <li key={gap}>{gap}</li>
                                   ))}
                                 </ul>
@@ -780,10 +852,9 @@ export default function App() {
                     ) : (
                       <div className="no-findings">
                         <div>✓</div>
-                        <h3>No review findings</h3>
+                        <h3>{loadedRun === runId ? "No review findings" : "Loading assessment…"}</h3>
                         <p>
-                          Nothing suspicious was detected within this run’s
-                          coverage. This does not prove the agent was safe.
+                          {loadedRun === runId ? "Nothing suspicious was detected within this run’s coverage. This does not prove the agent was safe." : "Loading evidence. No conclusion is available yet."}
                         </p>
                       </div>
                     )}

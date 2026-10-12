@@ -26,20 +26,27 @@ def state_root() -> Path:
 
 def _usage() -> str:
     return (
-        "usage: traceward run [--goal TEXT | --goal-file PATH] [--judge-provider lmstudio|laya] [--judge-url URL] [--judge-model MODEL] [--laya-url URL] [--runner-image IMAGE] [--workspace PATH] [--guest-image IMAGE] codex [CODEX FLAGS...]\n"
+        "usage: traceward run [--goal TEXT | --goal-file PATH] [--context-mode metadata|redacted] [--validation-script PATH] [--permissions-file PATH] [--shared-root PATH] [--judge-provider lmstudio|laya] [--judge-url URL] [--judge-model MODEL] [--runner-image IMAGE] [--workspace PATH] [--guest-image IMAGE] [--defer-judge] codex [AGENT FLAGS...]\n"
+        "       traceward eval pi [--cases CASE...] [--trials N] [--actor-model MODEL] [--actor-url URL]\n"
         "       traceward watch RUN_ID\n"
         "       traceward dashboard [--runs-dir PATH] [--port PORT]\n"
-        "       traceward replay --goal TEXT --hooks FILE --trace FILE"
+        "       traceward replay --goal TEXT --hooks FILE --trace FILE\n"
+        "       traceward rebuild-graph"
     )
 
 
-def _parse_run(args: list[str]) -> tuple[str, str | None, list[str], str | None, str | None, str | None, dict]:
+def _parse_run(args: list[str]) -> tuple:
     goal = goal_file = laya_url = image = workspace = guest_image = None
     judge_options = {}
+    agent_options = {}
     index = 0
-    while index < len(args) and args[index] != "codex":
+    while index < len(args) and args[index] not in {"codex"}:
         flag = args[index]
-        if flag not in {"--goal", "--goal-file", "--laya-url", "--runner-image", "--workspace", "--guest-image", "--judge-provider", "--judge-url", "--judge-model"} or index + 1 >= len(args):
+        if flag == '--defer-judge':
+            agent_options['defer_evaluation'] = True
+            index += 1
+            continue
+        if flag not in {"--goal", "--goal-file", "--laya-url", "--runner-image", "--workspace", "--guest-image", "--judge-provider", "--judge-url", "--judge-model", '--context-mode', '--validation-script', '--permissions-file', '--shared-root'} or index + 1 >= len(args):
             raise ValueError(_usage())
         value = args[index + 1]
         if flag == "--goal":
@@ -54,11 +61,18 @@ def _parse_run(args: list[str]) -> tuple[str, str | None, list[str], str | None,
             workspace = value
         elif flag.startswith('--judge-'):
             judge_options[flag.removeprefix('--judge-')] = value
+        elif flag == '--shared-root':
+            agent_options.setdefault('shared_roots', []).append(value)
+        elif flag in {'--context-mode', '--validation-script', '--permissions-file'}:
+            agent_options[flag[2:].replace('-', '_')] = value
         else:
             guest_image = value
         index += 2
-    if index >= len(args) or args[index] != "codex":
+    if index >= len(args) or args[index] not in {"codex"}:
         raise ValueError(_usage())
+    agent_options['agent'] = args[index]
+    if agent_options.get('context_mode', 'metadata') not in {'metadata', 'redacted'}:
+        raise ValueError('--context-mode must be metadata or redacted')
     if goal and goal_file:
         raise ValueError("choose --goal or --goal-file, not both")
     if laya_url and judge_options:
@@ -74,7 +88,7 @@ def _parse_run(args: list[str]) -> tuple[str, str | None, list[str], str | None,
             raise ValueError("a non-interactive run requires --goal or --goal-file")
     if not goal:
         raise ValueError("goal cannot be empty")
-    return goal, laya_url, args[index + 1:], image, workspace, guest_image, judge_options
+    return goal, laya_url, args[index + 1:], image, workspace, guest_image, judge_options, agent_options
 
 
 def _tail_lines(path: Path, offset: int, pending: str) -> tuple[list[str], int, str]:
@@ -97,12 +111,12 @@ def _safe_run_dir(run_id: str) -> Path:
     return state_root() / str(parsed)
 
 
-def _write_manifest(path: Path, run_id: str, goal: str, started_at: float) -> None:
+def _write_manifest(path: Path, run_id: str, goal: str, started_at: float, agent: str = 'codex') -> None:
     """Atomically publish liveness without exposing an agent prompt or login data."""
     item = {"run_id": run_id, "goal": redact(goal, 1000), "started_at": started_at,
             "heartbeat_at": time.time(),
-            "source": "scripted_agent" if os.environ.get("TRACEWARD_DEMO_CASE") else "codex",
-            "demo_case": os.environ.get("TRACEWARD_REAL_CASE") or os.environ.get("TRACEWARD_DEMO_CASE"),
+            "source": "scripted_agent" if os.environ.get("TRACEWARD_DEMO_CASE") else agent,
+            "demo_case": os.environ.get('TRACEWARD_EVALUATION_CASE') or os.environ.get("TRACEWARD_REAL_CASE") or os.environ.get("TRACEWARD_DEMO_CASE"),
             "observer_version": "gvisor-v1", "runtime": "gvisor"}
     temporary = path.with_suffix(".tmp")
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -117,8 +131,15 @@ def _write_manifest(path: Path, run_id: str, goal: str, started_at: float) -> No
         temporary.unlink(missing_ok=True)
 
 
-def run(args: list[str]) -> int:
-    goal, laya_url, codex_args, image, workspace, guest_image, judge_options = _parse_run(args)
+def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_name='codex') -> int:
+    goal, laya_url, codex_args, image, workspace, guest_image, judge_options, agent_options = _parse_run(args)
+    defer_evaluation = agent_options.pop('defer_evaluation', False)
+    context_mode = agent_options.pop('context_mode', 'metadata')
+    validator = agent_options.pop('validation_script', None)
+    permission_file = agent_options.pop('permissions_file', None)
+    shared_roots = agent_options.pop('shared_roots', [])
+    agent_options.pop('agent')
+    agent = agent_name
     run_id = str(uuid.uuid4())
     run_dir = _safe_run_dir(run_id)
     run_dir.mkdir(parents=True, mode=0o700)
@@ -128,10 +149,10 @@ def run(args: list[str]) -> int:
         file.touch(mode=0o600)
         file.chmod(0o600)
     started_at = time.time()
-    _write_manifest(run_dir / "run.json", run_id, goal, started_at)
+    _write_manifest(run_dir / "run.json", run_id, goal, started_at, agent)
     try:
-        runtime = ManagedRuntime(run_dir, run_id, codex_args, image=image,
-                                 workspace=workspace, guest_image=guest_image)
+        runtime = (runtime_factory or ManagedRuntime)(run_dir, run_id, codex_args, image=image,
+                                 workspace=workspace, guest_image=guest_image, context_mode=context_mode, **(runtime_options or {}))
     except Exception:
         path = run_dir / "summary.json"
         path.write_text(json.dumps({"run_id": run_id, "goal": redact(goal, 1000),
@@ -146,10 +167,42 @@ def run(args: list[str]) -> int:
             print(f"[TraceWard] finding {finding['finding_id']} r{finding['revision']}: "
                   f"{finding['status']} — {finding['title']}", file=sys.stderr, flush=True)
     from .judges import judge
+    from .state import StateObserver, independent_validation
+    from .context import codex_session, permissions
+    root = Path(runtime.metadata['workspace'])
+    for shared in shared_roots:
+        if not Path(shared).resolve().is_relative_to(root):
+            raise ValueError('--shared-root must be inside the observed workspace')
+    frozen_validator = None
+    if validator:
+        source = Path(validator).expanduser()
+        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            import stat
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024:
+                raise ValueError('validation script must be a bounded regular file')
+            data = os.read(fd, 1024 * 1024 + 1)
+        finally: os.close(fd)
+        frozen_validator = run_dir / 'independent-check.py'
+        vfd = os.open(frozen_validator, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(vfd, 'wb') as stream: stream.write(data)
     engine = Engine(goal, store, alert_fn=alert, coverage_gaps=[],
+                    workspace=runtime.metadata["workspace"],
+                    defer_evaluation=defer_evaluation,
+                    extended_analysis=True, context_mode=context_mode,
+                    graph_path=state_root().parent / 'evidence-graph.sqlite', shared_roots=shared_roots,
+                    transport_endpoints=runtime.transport_endpoints,
+                    agent_state_roots=runtime.agent_state_roots,
                     judge_fn=lambda evidence: judge(evidence, laya_url=laya_url, **judge_options))
     for gap in runtime.gaps:
         engine.add_gap(gap)
+    states = StateObserver(root, context_mode)
+    for observation in states.begin(): engine.observe(observation)
+    if permission_file:
+        observations, gaps = permissions(Path(permission_file), workspace=root, run_id=run_id)
+        for observation in observations: engine.observe(observation)
+        for gap in gaps: engine.add_gap(gap)
     parser = GvisorParser(os.getcwd(), runtime.metadata.get("abi", "arm64"))
     print(f"TraceWard run {run_id} — evidence: {run_dir}", file=sys.stderr, flush=True)
     print("Runtime: managed gVisor (Linux guest)", file=sys.stderr, flush=True)
@@ -185,12 +238,13 @@ def run(args: list[str]) -> int:
         child = subprocess.Popen(runtime.command)
         while child.poll() is None:
             if time.monotonic() - last_heartbeat >= 2:
-                _write_manifest(run_dir / "run.json", run_id, goal, started_at)
+                _write_manifest(run_dir / "run.json", run_id, goal, started_at, agent)
                 last_heartbeat = time.monotonic()
             drain()
             if not warned_hooks and time.monotonic() - started > 15 and not engine.counts.get("hook"):
                 warned_hooks = True
-                print("TraceWard: no Codex hook received; review hook trust via /hooks. "
+                instruction = runtime.hook_setup_hint
+                print(f"TraceWard: no {agent} hook received; {instruction}. "
                       "Combined coverage is not established.", file=sys.stderr, flush=True)
             time.sleep(0.1)
         exit_code = child.wait()
@@ -209,12 +263,37 @@ def run(args: list[str]) -> int:
         engine.add_gap("collector failure or rejected/dropped messages; run coverage is incomplete")
     if parser.unparsed:
         engine.add_gap(f"{parser.unparsed} gVisor records could not be normalized")
+    if runtime.permission_log and runtime.permission_log.exists():
+        observations, gaps = permissions(runtime.permission_log, workspace=root, run_id=run_id)
+        for observation in observations: engine.observe(observation)
+        for gap in gaps: engine.add_gap(gap)
+    for observation in states.end(): engine.observe(observation)
+    for gap in set(states.gaps): engine.add_gap(gap)
+    if context_mode == 'redacted' and agent == 'codex':
+        sessions = {h.get('session_id') for h in engine.hooks if h.get('session_id')}
+        for identity in sessions:
+            try: uuid.UUID(identity)
+            except (ValueError, TypeError):
+                engine.add_gap('invalid Codex session identity; semantic context not imported'); continue
+            matches = list((runtime.home / 'sessions').rglob('*' + identity + '*.jsonl'))[:2]
+            if len(matches) != 1:
+                engine.add_gap('Codex session context file missing or ambiguous'); continue
+            try: observations, gaps = codex_session(matches[0], expected_session_id=identity)
+            except (OSError, ValueError):
+                engine.add_gap('Codex session context could not be safely read'); continue
+            for observation in observations: engine.observe(observation)
+            for gap in gaps: engine.add_gap(gap)
+    if frozen_validator:
+        engine.observe(independent_validation(root, frozen_validator, runtime.image))
     engine.finish()
     summary = {**engine.summary(), **runtime.metadata, **status,
-               "run_id": run_id, "codex_exit_code": exit_code,
+               "run_id": run_id, "agent_exit_code": exit_code,
+               "codex_exit_code": exit_code if agent == 'codex' else None,
                "wall_seconds": round(time.monotonic() - started, 3),
                "unparsed_runtime_records": parser.unparsed,
                "runtime_overhead": "see separate comparable-run measurements"}
+    summary['context_mode'] = context_mode
+    summary['state_snapshot_gaps'] = list(set(states.gaps))
     path = run_dir / "summary.json"
     path.write_text(json.dumps(summary, indent=2) + "\n")
     path.chmod(0o600)
@@ -247,6 +326,23 @@ def watch(run_id: str) -> int:
         time.sleep(0.2)
 
 
+def _agent_argument(args):
+    index = 0
+    while index < len(args) and args[index].startswith('--'):
+        index += 1 if args[index] == '--defer-judge' else 2
+    return args[index] if index < len(args) else None
+
+
+def _pi_harness():
+    try:
+        from traceward_pi import cli
+        return cli
+    except ModuleNotFoundError as exc:
+        if exc.name and exc.name.startswith('traceward_pi'):
+            raise RuntimeError('Pi is an optional evaluation harness. Install it with: pip install -e evaluation/pi') from exc
+        raise
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     try:
@@ -255,7 +351,11 @@ def main(argv: list[str] | None = None) -> int:
             print(_usage())
             return 0
         if args[0] == "run":
+            if _agent_argument(args[1:]) == 'pi':
+                return _pi_harness().run(args[1:])
             return run(args[1:])
+        if args[:2] == ['eval', 'pi']:
+            return _pi_harness().main(['eval', *args[2:]])
         if args[0] == "watch" and len(args) == 2:
             return watch(args[1])
         if args[0] == "dashboard":
@@ -264,6 +364,12 @@ def main(argv: list[str] | None = None) -> int:
         if args[0] == "replay":
             from .replay import replay
             return replay(args[1:])
+        if args == ['rebuild-graph']:
+            from .graph import EvidenceGraph
+            graph = EvidenceGraph(state_root().parent/'evidence-graph.sqlite','rebuild')
+            try: print(f'Rebuilt {graph.rebuild(state_root())} observations from JSONL')
+            finally: graph.close()
+            return 0
         raise ValueError(_usage())
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"traceward: {exc}", file=sys.stderr)

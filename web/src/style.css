@@ -991,3 +991,16 @@ pre {
     padding: 0 18px;
   }
 }
+
+.assessment-facets { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 18px 0; }
+.assessment-facet { border: 1px solid #dbe3eb; border-left: 3px solid #94a3b8; border-radius: 8px; padding: 12px; min-width: 0; }
+.assessment-facet[data-status="concern"] { border-left-color: #e11d48; }
+.assessment-facet[data-status="supported"] { border-left-color: #059669; }
+.assessment-facet[data-status="unknown"] { border-left-color: #d97706; }
+.assessment-facet > div:first-child { display: flex; flex-wrap: wrap; gap: 8px; justify-content: space-between; }
+.assessment-facet strong { text-transform: capitalize; font-size: 13px; }
+.assessment-facet span { font-size: 11px; color: #64748b; }
+.assessment-facet p { margin: 8px 0; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.supported-facts { border-top: 1px solid #dbe3eb; margin-top: 16px; padding-top: 14px; font-size: 12px; }
+.semantic-evidence pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+@media (max-width: 900px) { .assessment-facets { grid-template-columns: 1fr; } }

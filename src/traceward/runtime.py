@@ -8,6 +8,8 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Callable
 
 from .config import OBSERVER_KEYS
 
@@ -94,26 +96,64 @@ def workspace_root(cwd: Path, selected: str | None) -> tuple[Path, list[Path]]:
     return root, extras
 
 
+@dataclass
+class AgentSpec:
+    """Observer-selected agent setup, shared by core and optional harnesses."""
+    name: str
+    home: Path
+    home_target: str
+    command: list[str]
+    image: str
+    env: dict = field(default_factory=dict)
+    metadata: dict = field(default_factory=dict)
+    forward_host_env: tuple[str, ...] = ()
+    transport_endpoints: tuple[str, ...] = ()
+    ensure_default_image: Callable[[], dict] | None = None
+    supervisor_module: str = 'traceward.runner'
+    request_extra: dict = field(default_factory=dict)
+    network_none: bool = False
+    embedded_supported: bool = True
+    enforcement_actors: tuple[str, ...] = ()
+    hook_setup_hint: str = 'review hook trust via /hooks'
+    permission_log: Path | None = None
+
+
 class ManagedRuntime:
     def __init__(self, run_dir: Path, run_id: str, args: list[str], *,
-                 image: str | None = None, workspace: str | None = None, guest_image: str | None = None):
+                 image: str | None = None, workspace: str | None = None, guest_image: str | None = None,
+                 agent_spec: AgentSpec | None = None, context_mode: str = 'metadata'):
         self.run_dir, self.container = run_dir, "traceward-" + run_id
         self.embedded = os.environ.get("TRACEWARD_MANAGED_RUNNER") == "1"
-        self.image = image or os.environ.get("TRACEWARD_RUNNER_IMAGE", RUNNER_IMAGE)
+        spec = agent_spec or AgentSpec('codex', codex_home(), '/codex-home',
+            ['codex', *hook_overrides(), *args], os.environ.get('TRACEWARD_RUNNER_IMAGE', RUNNER_IMAGE),
+            env={'CODEX_HOME':'/codex-home'}, metadata={'codex_version':'0.159.3'},
+            forward_host_env=('OPENAI_API_KEY','CODEX_API_KEY','HTTP_PROXY','HTTPS_PROXY','NO_PROXY'),
+            enforcement_actors=('Codex',))
+        if self.embedded and not spec.embedded_supported:
+            raise ValueError(f'{spec.name} evaluation requires the managed Docker boundary')
+        self.image = image or spec.image
+        self.transport_endpoints = spec.transport_endpoints
+        self.agent_state_roots = (spec.home_target,)
+        self.hook_setup_hint = spec.hook_setup_hint
+        self.permission_log = spec.permission_log
         self.gaps = ["mmap-backed reads, unsupported syscalls and effects outside the guest are not fully observed",
                      "hook records are agent-writable; evidence is not tamper-proof",
                      "network metadata does not prove payload contents or sensitive-byte transmission"]
         cwd = Path.cwd().resolve()
         root, extras = workspace_root(cwd, workspace)
-        home = codex_home()
-        env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/codex-home", "CODEX_HOME": "/codex-home",
+        home, home_target = spec.home, spec.home_target
+        self.home = home
+        if context_mode not in {'metadata', 'redacted'}: raise ValueError('invalid context mode')
+        env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": home_target,
                "LANG": "C.UTF-8", "TERM": os.environ.get("TERM", "xterm-256color"),
                "TRACEWARD_RUN_ID": run_id, "TRACEWARD_HOOK_FILE": "/traceward-hooks/hooks.jsonl"}
+        env['TRACEWARD_CONTEXT_MODE'] = context_mode
+        env.update(spec.env)
         if os.environ.get("TRACEWARD_DEMO_CASE"):
             env["TRACEWARD_DEMO_CASE"] = os.environ["TRACEWARD_DEMO_CASE"]
             env["PYTHONPATH"] = "/opt/traceward-hooks"
         # Narrow agent environment, never observer settings or arbitrary host credentials.
-        for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"):
+        for key in spec.forward_host_env:
             if key in os.environ and key not in OBSERVER_KEYS:
                 env[key] = os.environ[key]
         observer_file = Path(os.environ.get("TRACEWARD_ENV_FILE", str(Path(__file__).resolve().parents[2] / ".env"))).resolve()
@@ -122,26 +162,30 @@ class ManagedRuntime:
         if run_dir.is_relative_to(root):
             raise ValueError("runs directory must be outside the workspace to keep evidence outside the guest")
         outer_mounts = [(root, str(root), True), *[(p, str(p), True) for p in extras],
-                        (home, "/codex-home", True), (run_dir, "/observer-run", True)]
+                        (home, home_target, True), (run_dir, "/observer-run", True)]
         guest_mounts = [(str(root), str(root), True), *[(str(p), str(p), True) for p in extras],
-                        ("/codex-home", "/codex-home", True),
+                        (home_target, home_target, True),
                         ("/observer-run/hooks.jsonl", "/traceward-hooks/hooks.jsonl", True),
                         ("/opt/traceward/src", "/opt/traceward-hooks", False)]
-        self.metadata = {"runtime": "gvisor", "runner_image": self.image, "codex_version": "0.159.3",
-                         "workspace": str(root), "guest_os": "Linux", "enforcement_actors": ["Docker", "gVisor", "Codex"]}
-        self.command = [sys.executable, "-m", "traceward.runner", str(run_dir / "request.json")]
+        self.metadata = {"runtime": "gvisor", "runner_image": self.image, 'agent': spec.name,
+                         "workspace": str(root), "guest_os": "Linux", "enforcement_actors": ["Docker", "gVisor"]}
+        self.metadata.update(spec.metadata)
+        self.metadata['enforcement_actors'].extend(spec.enforcement_actors)
+        self.command = [sys.executable, '-m', spec.supervisor_module, str(run_dir/'request.json')]
         rootfs = "/opt/traceward/rootfs"
         if self.embedded:
-            guest_mounts = [(str(home) if source == "/codex-home" else
+            guest_mounts = [(str(home) if source == home_target else
                              str(run_dir / "hooks.jsonl") if source.endswith("hooks.jsonl") else source,
                              target, writable) for source, target, writable in guest_mounts]
         else:
-            inspected = ensure_image(self.image)
+            inspected = spec.ensure_default_image() if spec.ensure_default_image and not image else ensure_image(self.image)
             self.metadata["runner_image_id"] = inspected["Id"]
             self.metadata["abi"] = inspected["Architecture"]
             self.command = ["docker", "run", "--rm", "--name", self.container,
                             "--cap-add=SYS_ADMIN", "--cap-add=SYS_PTRACE",
                             "--security-opt", "seccomp=unconfined", "--security-opt", "apparmor=unconfined", "-i"]
+            if spec.network_none:
+                self.command += ['--network=none']
             if sys.stdin.isatty() and sys.stdout.isatty():
                 self.command.append("-t")
             if guest_image:
@@ -166,11 +210,12 @@ class ManagedRuntime:
                     raise ValueError("Docker bind paths containing commas are unsupported")
                 self.command += ["--mount", f"type=bind,source={source},target={target}" + ("" if writable else ",readonly")]
             self.command += ["--entrypoint", "/usr/local/bin/python3", self.image,
-                             "-m", "traceward.runner", "/observer-run/request.json"]
+                             "-m", spec.supervisor_module, "/observer-run/request.json"]
         request = {"run_id": run_id, "cwd": str(cwd), "uid": os.getuid(), "gid": os.getgid(),
-                   "command": ["codex", *hook_overrides(), *args], "env": env,
+                   "command": spec.command, "env": env, 'agent': spec.name, 'home_target': home_target,
                    "guest_mounts": guest_mounts, "rootfs": rootfs,
-                   "fixture_receiver": os.environ.get("TRACEWARD_FIXTURE_RECEIVER") == "1"}
+                   "fixture_receiver": os.environ.get("TRACEWARD_FIXTURE_RECEIVER") == "1",
+                   **spec.request_extra}
         fd = os.open(run_dir / "request.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as stream:
             json.dump(request, stream)

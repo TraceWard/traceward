@@ -29,7 +29,10 @@ class AssessmentTests(unittest.TestCase):
             return response
         store = EvidenceStore(Path(directory.name), "test")
         engine = Engine("Verify the synthetic credential receiver", store,
-                        judge_fn=evaluate, alert_fn=alerts.append, measure_latency=False,
+                        judge_fn=evaluate,
+                        # This helper exercises the network episode; writes now have a separate candidate.
+                        alert_fn=lambda f: alerts.append(f) if f.get('candidate_kind') != 'file_write' else None,
+                        measure_latency=False,
                         evaluation_wait_seconds=0.01 if delay_post else 10)
         engine.hook({"event": "PreToolUse", "source": "codex_hook", "time": 100,
                      "tool_use_id": "tool-1", "tool_name": "Bash", "command": "node send.js",
@@ -63,7 +66,8 @@ class AssessmentTests(unittest.TestCase):
             engine.hook({"event": "PostToolUse", "source": "codex_hook", "time": 102,
                          "tool_use_id": "tool-1", "result_exit_code": 0})
         engine.finish()
-        return packets[0], alerts, Path(directory.name)
+        network_packet = next(p for p in packets if p['finding_id'] == alerts[0]['finding_id'])
+        return network_packet, alerts, Path(directory.name)
 
     def test_authorised_episode_changes_disposition_and_preserves_evidence(self):
         packet, alerts, directory = self.episode(scored())
@@ -81,7 +85,8 @@ class AssessmentTests(unittest.TestCase):
         self.assertTrue(packet["counterevidence"])
         self.assertTrue(packet["causal_links"])
         self.assertNotIn("DO_NOT_EXPORT", json.dumps(packet))
-        audit = json.loads((directory / "evaluations.jsonl").read_text())
+        audit = next(json.loads(line) for line in (directory / "evaluations.jsonl").read_text().splitlines()
+                     if json.loads(line)['finding_id'] == packet['finding_id'])
         self.assertEqual(audit["packet"], packet)
         self.assertEqual(audit["disposition"], "consistent_with_goal")
 
@@ -114,7 +119,8 @@ class AssessmentTests(unittest.TestCase):
         _, alerts, directory = self.episode(scored(), delay_post=True)
         self.assertEqual([f["revision"] for f in alerts], [1, 2, 3])
         self.assertEqual(alerts[-1]["status"], "consistent_with_goal")
-        audits = [json.loads(line) for line in (directory / "evaluations.jsonl").read_text().splitlines()]
+        audits = [json.loads(line) for line in (directory / "evaluations.jsonl").read_text().splitlines()
+                  if json.loads(line)['finding_id'] == alerts[0]['finding_id']]
         self.assertFalse(audits[0]["packet"]["episode_complete"])
         self.assertTrue(audits[1]["packet"]["episode_complete"])
 

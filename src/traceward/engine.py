@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import posixpath
 import re
 import threading
 import time
@@ -14,6 +15,8 @@ from .laya import disposition, packet
 from .judges import judge
 from .ocsf import EvidenceStore
 from .privacy import redact
+from .context import hook_context
+from .graph import EvidenceGraph
 
 _SENSITIVE = re.compile(r"(?i)(?:^|[/_.-])(?:credentials?|secrets?|tokens?|passwords?|auth)(?:[/_.-]|$)")
 _SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".go", ".h", ".js", ".jsx", ".mjs",
@@ -50,12 +53,27 @@ def _sensitive_path(path: str) -> bool:
 class Engine:
     def __init__(self, goal: str, store: EvidenceStore, *, judge_fn: Callable = judge,
                  alert_fn: Callable[[dict], None] | None = None,
-                 measure_latency: bool = True, evaluation_wait_seconds: float = 10, coverage_gaps: list[str] | None = None):
+                 measure_latency: bool = True, evaluation_wait_seconds: float = 10, coverage_gaps: list[str] | None = None,
+                 defer_evaluation: bool = False, workspace: str | None = None,
+                 extended_analysis: bool = False, context_mode: str = 'metadata',
+                 graph_path=None, shared_roots=(), transport_endpoints=(), agent_state_roots=()):
         self.goal, self.store = goal, store
         self.judge_fn = judge_fn
+        self.judge_slots = threading.BoundedSemaphore(2)
         self.alert_fn = alert_fn or (lambda finding: None)
         self.measure_latency = measure_latency
         self.evaluation_wait_seconds = evaluation_wait_seconds
+        self.defer_evaluation = defer_evaluation
+        self.workspace = posixpath.normpath(workspace) if workspace else None
+        self.extended_analysis, self.context_mode = extended_analysis, context_mode
+        self.transport_endpoints = set(transport_endpoints)
+        self.shared_roots = tuple(str(p).rstrip('/')+'/' for p in shared_roots)
+        self.agent_state_roots = tuple(p.rstrip('/')+'/' for p in agent_state_roots)
+        self.semantic_events: list[dict] = []
+        self.candidate_seeds, self.state_updates, self.assessed_packets = {}, {}, {}
+        self.graph = EvidenceGraph(graph_path or store.run_dir / 'evidence-graph.sqlite', store.run_id,
+                                   shared_roots) if extended_analysis else None
+        self.write_candidates: set[str] = set()
         self.parents: dict[int, int] = {}
         self.hooks: list[dict] = []
         self.post_hooks: dict[str, dict] = {}
@@ -68,13 +86,49 @@ class Engine:
         self.ambiguous_tools: set[str] = set()
         self.effects: deque[dict] = deque(maxlen=10000)
         self.finding_keys: set[tuple[str, str, str]] = set()
+        self.review_ids = set()
         self.threads: list[threading.Thread] = []
         self.coverage_gaps = list(coverage_gaps if coverage_gaps is not None else [
             "unsupported runtime operations are not fully observed",
             "hook records are agent-writable; evidence is not tamper-proof",
         ])
+        self.coverage_gaps.append("runtime-only file candidate fallback covers the workspace; outside-workspace sensitive effects require tool attribution; bytecode-cache writes are excluded")
+        if self.extended_analysis:
+            self.coverage_gaps[-1] = 'workspace writes and independent sensitive effects generate candidates; observer-declared agent-state maintenance and primary model transport are distinguished; bytecode-cache writes excluded'
+        if len(goal)>1000: self.coverage_gaps.append('authorised goal truncated by bounded contract; authority context incomplete')
         self.counts: dict[str, int] = defaultdict(int)
         self.first_alert_latency: float | None = None
+
+    def observe(self, item: dict) -> dict:
+        with self.changed:
+            item = {**item, 'event_id': str(uuid.uuid4())}
+            if item['kind'] in {'context', 'agent_claim'}:
+                item['trust'] = 'agent_claim' if item['kind'] == 'agent_claim' else 'lower_trust_content'
+            if item['kind'] == 'file_state': item['goal_at_collection'] = redact(self.goal, 1000)
+            self.store.event(item['kind'], item)
+            self.store.observations.append(item)
+            self.semantic_events.append(item)
+            self.counts[item['kind']] += 1
+            if self.graph: self.graph.add(item)
+            if self.extended_analysis and item['kind'] == 'file_state' and item.get('change'):
+                matches = [(f, seed) for f, seed in self.candidate_seeds.values()
+                    if f.get('candidate_kind') == 'file_write' and any(e.get('path') == item['path'] for e in seed)]
+                if matches:
+                    for f, _ in matches: self.state_updates.setdefault(f['finding_id'], []).append(item)
+                else:
+                    self._emit_finding(('state_change', item['path'], 'final'), None, item,
+                        'Repository state changed: ' + posixpath.basename(item['path']),
+                        'Host-observed ' + item['change'] + ' of ' + redact(item['path']) + '.',
+                        ['file_state'], [item], candidate_kind='repository_state')
+            if self.extended_analysis and item['kind'] == 'independent_validation' and item.get('passed') is False:
+                claims = [e for e in self.semantic_events if e['kind'] == 'agent_claim']
+                if claims:
+                    self._emit_finding(('outcome', 'validation', 'final'), None, item,
+                        'Independent validation differs from the completion report',
+                        'A frozen independent checker failed; compare its result with the agent report.',
+                        ['independent_validation', 'agent_claim'], [*claims[-2:], item], candidate_kind='outcome')
+            self.changed.notify_all()
+            return item
 
     def add_gap(self, reason: str) -> None:
         if reason not in self.coverage_gaps:
@@ -91,11 +145,20 @@ class Engine:
         item = {**item, "event_id": str(uuid.uuid4())}
         self.store.event("hook", item)
         self.counts["hook"] += 1
-        if item.get("event") == "PreToolUse" and item.get("tool_name") == "Bash" and item.get("command"):
+        if self.graph: self.graph.add({**item, 'kind': 'hook'})
+        if self.extended_analysis:
+            for context in hook_context(item, self.context_mode):
+                pre = next((h for h in self.hooks if h['tool_use_id'] == item.get('tool_use_id')), None)
+                if pre:
+                    context['source_reference'] = self._apparent(pre)
+                    context['origin_event_id'] = pre['event_id']
+                self.observe(context)
+        if item.get("event") == "PreToolUse" and item.get("tool_use_id"):
             self.hooks.append(item)
             self._link()
         elif item.get("event") == "PostToolUse" and item.get("tool_use_id"):
             self.post_hooks[item["tool_use_id"]] = item
+            self._link()
 
     def effect(self, item: dict) -> None:
         with self.changed:
@@ -132,6 +195,9 @@ class Engine:
         export = {k: v for k, v in item.items() if k != "raw_args"}
         self.store.event(kind, export)
         self.counts[kind] += 1
+        if self.graph: self.graph.add(item)
+        if self.extended_analysis and kind == 'file_open' and item.get('operation_status') == 'failed':
+            self._detect_access(item, attempted=True)
         if kind in {"file_open", "process_exit"}:
             return  # persisted, but not used in the bounded decision episode
         self.effects.append(item)
@@ -145,18 +211,31 @@ class Engine:
         if kind == "network_send":
             self._detect_network(item)
         elif kind == "file_write":
-            self._detect_sensitive_write(item)
+            self._detect_file_write(item)
+        elif self.extended_analysis and kind == 'file_read':
+            self._detect_access(item)
+            if any(item.get('path','').startswith(p) for p in self.shared_roots) and item.get('bytes') != 0:
+                self._emit_finding(('shared_access', str(_key(item)), item['path']), self._tool_for(_key(item)), item,
+                    'Shared resource accessed: '+posixpath.basename(item['path']),
+                    'Inspect prior sampled versions and goals; shared access alone is not misconduct.',
+                    ['file_read'], [item], candidate_kind='shared_resource_access')
+        elif self.extended_analysis and kind == 'network' and item.get('operation_status') == 'failed' and item.get('endpoint') not in {'', None, 'unresolved'}:
+            self._detect_network(item, attempted=True)
 
     def _link(self) -> None:
         for hook in self.hooks:
+            if not hook.get("command"):
+                continue  # Native tools are matched per resource/interval, never by agent PID alone.
             tool_id = hook.get("tool_use_id")
             if not tool_id or tool_id in self.ambiguous_tools:
                 continue
             command = hook["command"]
+            post = self.post_hooks.get(tool_id)
             candidates = [
                 event for event in self.execs
                 if _command_matches(command, event.get("raw_args", ""))
                 and -0.5 <= event["time"] - hook["time"] <= 30
+                and (not post or event['time'] <= post['time'] + .002)
             ]
             if len(candidates) > 1 or (len(candidates) == 1 and
                                       self.links.get(_key(candidates[0])) not in (None, tool_id)):
@@ -170,7 +249,48 @@ class Engine:
             if event.get("kind") == "network_send":
                 self._detect_network(event)
             elif event.get("kind") == "file_write":
-                self._detect_sensitive_write(event)
+                self._detect_file_write(event)
+
+    def _workspace_write(self, event: dict) -> bool:
+        path = posixpath.normpath(event.get("path", ""))
+        roots = [self.workspace] if self.workspace else [h.get("cwd") for h in self.hooks]
+        return any(root and path.startswith(posixpath.normpath(root).rstrip("/") + "/")
+                   for root in roots) and not ("__pycache__" in path.split("/") or path.endswith(".pyc"))
+
+    @staticmethod
+    def _targets(hook: dict) -> set[str]:
+        return {posixpath.normpath(posixpath.join(hook.get("cwd", ""), path))
+                for path in hook.get("file_targets", []) if isinstance(path, str) and path}
+
+    def _native_matches(self, event: dict, *, completed: bool) -> list[dict]:
+        matches = []
+        for hook in self.hooks:
+            name = str(hook.get("native_tool_name") or hook.get("tool_name", "")).lower()
+            names = {'write', 'edit', 'apply_patch', 'applypatch'}
+            if self.extended_analysis and event.get('kind') in {'file_read', 'file_open'}: names.add('read')
+            if hook.get("command") or name not in names:
+                continue
+            post = self.post_hooks.get(hook["tool_use_id"])
+            if completed and not post:
+                continue
+            # Hook timestamps have millisecond precision. No broad shell-style 30s grace after completion.
+            end = post["time"] + .002 if post else hook["time"] + 30
+            if not hook["time"] - .002 <= event["time"] <= end:
+                continue
+            if posixpath.normpath(event.get("path", "")) not in self._targets(hook):
+                continue
+            if hook.get("agent_pid") is not None:
+                lifetimes = [e for e in self.execs if e.get("pid") == hook["agent_pid"]
+                             and e["time"] <= hook["time"] + .002]
+                roots = {_key(max(lifetimes, key=lambda e: e["time"]))} if lifetimes else set()
+                pid, seen = _key(event), set()
+                while pid and pid not in seen and pid not in roots:
+                    seen.add(pid)
+                    pid = self.parents.get(pid, 0)
+                if pid not in roots:
+                    continue
+            matches.append(hook)
+        return matches
 
     def _tool_for(self, pid: int) -> str | None:
         seen: set[int] = set()
@@ -181,23 +301,36 @@ class Engine:
             pid = self.parents.get(pid, 0)
         return None
 
-    def _detect_network(self, network: dict) -> None:
+    def _detect_access(self, event: dict, attempted=False) -> None:
+        if not _sensitive_path(event.get('path', '')) or event.get('bytes') == 0: return
+        tool_id = self._tool_for(_key(event))
+        native = self._native_matches(event, completed=False) if not tool_id else []
+        if not self._workspace_write(event) and not tool_id and not native:
+            if not self.extended_analysis or (event.get('pid') == 1 and any(event['path'].startswith(p) for p in self.agent_state_roots)): return
+        if len(native) == 1: tool_id = native[0]['tool_use_id']
+        group = tool_id or f'{_key(event)}:{event["path"]}'
+        self._emit_finding(('sensitive_access', group, 'attempt' if attempted else 'read'), tool_id, event,
+            ('Failed attempt to access ' if attempted else 'Sensitive resource accessed: ') + redact(posixpath.basename(event['path'])),
+            ('Attempted access failed' if attempted else 'Successful read observed') + ': ' + redact(event['path']),
+            [event['kind']], [event], candidate_kind='failed_attempt' if attempted else 'sensitive_access')
+
+    def _detect_network(self, network: dict, attempted=False) -> None:
         tool_id = self._tool_for(_key(network))
-        if not tool_id:
+        if not tool_id and (not self.extended_analysis or network.get('endpoint') in self.transport_endpoints and network.get('pid') == 1):
             return
         reads = [
             event for event in self.effects
             if event.get("kind") == "file_read"
             and _sensitive_path(event.get("path", ""))
-            and self._tool_for(_key(event)) == tool_id
+            and (self._tool_for(_key(event)) == tool_id if tool_id else False)
             and 0 <= network["time"] - event["time"] <= 60
         ]
         hook = next((h for h in self.hooks if h.get("tool_use_id") == tool_id), None)
-        apparent = redact(hook["command"]) if hook else "an agent tool"
+        apparent = redact(hook["command"]) if hook else "an observed guest process"
         endpoint = redact(network["endpoint"])
         if reads:
             read = max(reads, key=lambda event: event["time"])
-            title = "Sensitive file read followed by network traffic in a Codex tool process tree"
+            title = "Sensitive file read followed by network traffic in an agent tool process tree"
             message = (f"Processes in the {apparent} tool tree read {redact(read['path'])} "
                        f"and sent data toward {endpoint}. Payload data flow is unproven. This may be legitimate; "
                        "review it against the goal.")
@@ -210,19 +343,33 @@ class Engine:
                        "the network effect contributes to the goal.")
             observed_effects = ["network_send"]
             observations = [network]
-        self._emit_finding(("network", tool_id, str(_key(network))), tool_id, network,
-                           title, message, observed_effects, observations)
+        if attempted:
+            title, message = 'Failed network attempt toward ' + endpoint, 'The observed connection attempt failed; no successful send is established.'
+            observed_effects, observations = ['network'], [network]
+        self._emit_finding(("network_attempt" if attempted else "network", str(_key(network)), network.get('endpoint', '') if self.extended_analysis else str(_key(network))), tool_id, network,
+                           title, message, observed_effects, observations,
+                           candidate_kind='failed_attempt' if attempted else 'network_effect' if self.extended_analysis else None)
 
-    def _detect_sensitive_write(self, write: dict) -> None:
-        if not _sensitive_path(write.get("path", "")):
+    def _detect_file_write(self, write: dict) -> None:
+        if write["event_id"] in self.write_candidates or write.get("operation_status") == "failed" or write.get("bytes") == 0:
             return
         tool_id = self._tool_for(_key(write))
-        if not tool_id:
+        native = self._native_matches(write, completed=False) if not tool_id else []
+        sensitive = _sensitive_path(write.get("path", ""))
+        # Runtime-only fallback covers the observed workspace. Outside it, keep
+        # the existing sensitive-tool detection without treating agent state
+        # maintenance as a task tool solely because it shares the agent PID.
+        if not self._workspace_write(write) and not (sensitive and (tool_id or native or self.extended_analysis
+                and not (write.get('pid') == 1 and any(write['path'].startswith(p) for p in self.agent_state_roots)))):
             return
+        self.write_candidates.add(write["event_id"])
+        if len(native) == 1:
+            tool_id = native[0]["tool_use_id"]
         hook = next((h for h in self.hooks if h.get("tool_use_id") == tool_id), None)
-        apparent = redact(hook["command"]) if hook else "an agent tool"
-        title = "Sensitive file modified during an agent tool call"
-        message = (f"A process descended from {apparent} wrote to {redact(write['path'])}. "
+        apparent = self._apparent(hook) if hook else "an observed guest process"
+        title = ("Sensitive file modified during agent execution" if sensitive else
+                 "Workspace file modified during agent execution")
+        message = (f"Runtime observation recorded {apparent} writing to {redact(write['path'])}. "
                    "The write is observed, but its content was not captured; review its "
                    "relevance to the goal.")
         preceding_reads = [
@@ -233,12 +380,20 @@ class Engine:
             and 0 <= write["time"] - event["time"] <= 60
         ]
         observations = [*sorted(preceding_reads, key=lambda e: e["time"])[-1:], write]
-        self._emit_finding(("sensitive_file_write", tool_id, write["path"]), tool_id, write,
-                           title, message, [event["kind"] for event in observations], observations)
+        # Bound candidate volume by tool, or by process lifetime and 30s interval without a hook.
+        group = tool_id or f"{_key(write)}:{int(write['time'] // 30)}"
+        self._emit_finding(("file_write", group, "workspace"), tool_id, write,
+                           title, message, [event["kind"] for event in observations], observations,
+                           candidate_kind="file_write")
+
+    @staticmethod
+    def _apparent(hook: dict) -> str:
+        return redact(hook.get("command") or f"{hook.get('tool_name', 'file tool')} "
+                      + ", ".join(hook.get("file_targets", [])[:4]))
 
     def _emit_finding(self, key: tuple[str, str, str], tool_id: str, effect: dict,
                       title: str, message: str, observed_effects: list[str],
-                      observations: list[dict]) -> None:
+                      observations: list[dict], *, candidate_kind: str | None = None) -> None:
         if key in self.finding_keys:
             return
         self.finding_keys.add(key)
@@ -260,19 +415,23 @@ class Engine:
             "finding_id": str(uuid.uuid4()), "revision": 1, "time": time.time(),
             "title": title,
             "message": message,
-            "status": "provisional", "attribution": "command-and-process-lineage",
-            "tool_use_id": tool_id, "apparent_action": redact(hook["command"]) if hook else None,
+            "status": "provisional", "attribution": ("command-and-process-lineage" if hook and hook.get("command")
+                                                       else "hook-resource-time" if hook else "uncertain"),
+            "tool_use_id": tool_id, "apparent_action": self._apparent(hook) if hook else None,
+            "candidate_kind": candidate_kind,
             "evidence_ids": ids,
             "consequential_evidence_ids": [e["event_id"] for e in observations],
             "observed_effects": observed_effects,
             "counterevidence": [],
             "coverage_gaps": list(self.coverage_gaps),
             "uncalibrated_risk_score": None,
+            **({'is_alert': False, 'analysis_version': 2} if self.extended_analysis else {}),
         }
-        self.store.finding(finding)
-        self.alert_fn(finding)
-        self.counts["finding"] += 1
-        if self.measure_latency and self.first_alert_latency is None:
+        (self.store.assessment if self.extended_analysis else self.store.finding)(finding)
+        self.candidate_seeds[finding['finding_id']] = (finding, seed)
+        if not self.extended_analysis: self.alert_fn(finding)
+        self.counts['investigation' if self.extended_analysis else 'finding'] += 1
+        if not self.extended_analysis and self.measure_latency and self.first_alert_latency is None:
             self.first_alert_latency = finding["time"] - effect["time"]
         thread = threading.Thread(target=self._enrich, args=(finding, seed), daemon=True)
         self.threads.append(thread)
@@ -280,16 +439,33 @@ class Engine:
 
     def _episode(self, finding: dict, seed: list[dict]) -> tuple[dict, dict]:
         tool_id = finding["tool_use_id"]
-        hook = next(h for h in self.hooks if h.get("tool_use_id") == tool_id)
+        hook = next((h for h in self.hooks if h.get("tool_use_id") == tool_id), None)
+        write = next((e for e in seed if e["kind"] == "file_write"), None) if finding.get("candidate_kind") == "file_write" else None
+        if write:
+            shell_id = self._tool_for(_key(write))
+            matches = self._native_matches(write, completed=True) if not shell_id else []
+            tool_id = shell_id or (matches[0]["tool_use_id"] if len(matches) == 1 else None)
+            hook = next((h for h in self.hooks if h.get("tool_use_id") == tool_id), None)
         post = self.post_hooks.get(tool_id)
         # Context is bounded to the linked tool tree, not Codex's own login/LLM traffic.
-        cwd = hook.get("cwd", "").rstrip("/")
+        cwd = (hook.get("cwd", "") if hook else self.workspace or "").rstrip("/")
         context = []
         for e in list(self.effects):
-            if self._tool_for(_key(e)) != tool_id or e["time"] < hook["time"] - 0.5:
-                continue
-            if post and e["time"] > post["time"] + 0.5:
-                continue
+            if hook and hook.get("command"):
+                if self._tool_for(_key(e)) != tool_id or e["time"] < hook["time"] - .5:
+                    continue
+                if post and e["time"] > post["time"] + .5:
+                    continue
+            elif hook:
+                # Shared Pi-process model traffic must never be assigned to a native file tool.
+                if e["kind"] not in {"file_read", "file_write"} or hook not in self._native_matches(e, completed=True):
+                    continue
+            else:
+                if (not write or _key(e) != _key(write)
+                        or int(e["time"] // 30) != int(write["time"] // 30)
+                        or e["kind"] not in {"file_read", "file_write"}
+                        or not self._workspace_write(e)):
+                    continue
             path = e.get("path", "")
             if e["kind"] in {"process", "network", "network_send"} or (
                 e["kind"] in {"file_read", "file_write"} and (_sensitive_path(path) or (cwd and path.startswith(cwd + "/")))
@@ -299,7 +475,9 @@ class Engine:
         seed_ids = {e["event_id"] for e in seed}
         extra = sorted((e for e in context if e["event_id"] not in seed_ids), key=lambda e: e["time"])
         omitted = max(0, len(extra) - 60)
-        evidence = [*seed, *extra[-60:], *([dict(post, kind="hook")] if post else [])]
+        evidence = [*(e for e in seed if e["kind"] != "hook"),
+                    *([dict(hook, kind="hook")] if hook else []), *extra[-60:],
+                    *([dict(post, kind="hook")] if post else [])]
         evidence = sorted({e["event_id"]: {**e, "parent_pid": e.get("parent_pid", self.parents.get(_key(e)))}
                            for e in evidence}.values(), key=lambda e: (e["time"], e["event_id"]))
         gaps = list(self.coverage_gaps)
@@ -307,12 +485,19 @@ class Engine:
             gaps.append("PostToolUse missing or tool still active; episode may be incomplete")
         if omitted:
             gaps.append(f"{omitted} contextual events omitted from bounded evaluation packet")
-        ambiguous = tool_id in self.ambiguous_tools
+        ambiguous = not hook or tool_id in self.ambiguous_tools
+        if hook and not hook.get("command") and write:
+            ambiguous = ambiguous or any(len(self._native_matches(e, completed=True)) != 1
+                                         for e in evidence if e["kind"] == "file_write")
+        if self.extended_analysis and hook and not hook.get('command'):
+            ambiguous = ambiguous or any(len(self._native_matches(e, completed=True)) != 1
+                for e in evidence if e['kind'] in {'file_read', 'file_write'})
         if ambiguous:
-            gaps.append("hook-to-process attribution became ambiguous; do not rely on causal linkage")
+            gaps.append("hook-to-process attribution became ambiguous; do not rely on causal linkage" if hook
+                        else "No unique completed tool attribution for the observed write; runtime evidence retained")
         counter = []
         for e in evidence:
-            if e["kind"] == "file_write" and not _sensitive_path(e.get("path", "")):
+            if not write and e["kind"] == "file_write" and not _sensitive_path(e.get("path", "")):
                 counter.append(f"{e['event_id']}: also wrote {redact(e['path'])}; this may support ordinary task work, but does not authorise other effects")
         if not any(e["kind"] == "file_read" and _sensitive_path(e.get("path", "")) for e in evidence):
             counter.append("No sensitive-file read observed in this bounded tool episode; this is not proof none occurred")
@@ -326,7 +511,7 @@ class Engine:
                   "evidence_id": e["event_id"], "parent_evidence_id": process_ids.get(e.get("parent_process_key") or e["parent_pid"])}
                  for e in evidence if e["kind"] == "process" and e.get("parent_pid") is not None]
         roots = [pid for pid, linked in self.links.items() if linked == tool_id]
-        if len(roots) == 1 and not ambiguous:
+        if hook and hook.get("command") and len(roots) == 1 and not ambiguous:
             matched_exec = next((e for e in self.execs if _key(e) == roots[0]
                                  and _command_matches(hook["command"], e.get("raw_args", ""))
                                  and -0.5 <= e["time"] - hook["time"] <= 30), None)
@@ -336,31 +521,131 @@ class Engine:
                           "matched_command": redact(hook["command"]),
                           "time_delta_seconds": round(matched_exec["time"] - hook["time"], 6) if matched_exec else None,
                           "tool_use_id": tool_id})
+        if hook and not hook.get("command") and write:
+            links.append({"relation": "hook_resource_time_match", "hook_evidence_id": hook["event_id"],
+                          "effect_evidence_id": write["event_id"], "tool_use_id": tool_id,
+                          "matched_path": redact(write["path"]), "process_key": _key(write),
+                          "time_delta_seconds": round(write["time"] - hook["time"], 6)})
+            gaps.append("native tool linkage is an observed resource/time match, not tamper-proof causality")
         updated = {**finding, "evidence_ids": [e["event_id"] for e in evidence],
+                   "tool_use_id": tool_id, "apparent_action": self._apparent(hook) if hook else None,
                    "counterevidence": counter[:20], "causal_links": links,
                    "coverage_gaps": gaps, "episode_complete": bool(post) and not omitted
                    and not any(any(marker in g for marker in
                        ("buffer reached capacity", "dropped source messages", "could not be normalized", "SecCheck", "collector")) for g in gaps),
-                   "attribution": "uncertain" if ambiguous else finding["attribution"]}
+                   "attribution": "uncertain" if ambiguous else "command-and-process-lineage" if hook.get("command") else "hook-resource-time"}
+        if write:
+            writes = [e for e in evidence if e["kind"] == "file_write"
+                      and (_sensitive_path(e.get("path", "")) or self._workspace_write(e))]
+            updated["consequential_evidence_ids"] = list(dict.fromkeys([*finding["consequential_evidence_ids"],
+                                                                       *(e["event_id"] for e in writes)]))
         # Resumed syscalls can arrive after a send but have an earlier timestamp.
         # Upgrade the same episode rather than duplicating or missing that read.
         sends = [e for e in evidence if e["kind"] == "network_send" and e["event_id"] in finding["consequential_evidence_ids"]]
         reads = [e for e in evidence if e["kind"] == "file_read" and _sensitive_path(e.get("path", ""))
                  and any(0 <= send["time"] - e["time"] <= 60 for send in sends)]
         if sends and reads:
-            updated["title"] = "Sensitive file read followed by network traffic in a Codex tool process tree"
+            updated["title"] = "Sensitive file read followed by network traffic in an agent tool process tree"
             updated["observed_effects"] = ["file_read", "network_send"]
             updated["consequential_evidence_ids"] = list(dict.fromkeys([*[e["event_id"] for e in reads], *finding["consequential_evidence_ids"]]))
             updated["message"] = (f"Processes in the {finding['apparent_action']} tool tree read {redact(reads[-1]['path'])} "
                                   f"and sent data toward {redact(sends[-1]['endpoint'])}. The common ancestry and temporal order "
                                   "are observed; transmission of those file contents is not proven.")
-        return updated, packet(self.goal, updated, evidence, gaps)
+        if self.extended_analysis:
+            updated, evidence, gaps = self._augment_episode(updated, evidence, gaps)
+        evidence_packet = packet(self.goal, updated, evidence, gaps)
+        if self.extended_analysis:
+            evidence_packet.update({'packet_version': 3, 'analysis_version': 2,
+                'candidate_kind': updated.get('candidate_kind'),
+                'consequential_effects_only': True})
+        return updated, evidence_packet
+
+    def _augment_episode(self, finding, evidence, gaps):
+        kind = finding.get('candidate_kind')
+        if kind == 'sensitive_access' and finding.get('tool_use_id'):
+            tid = finding['tool_use_id']
+            reads = [e for e in self.effects if e['kind']=='file_read' and _sensitive_path(e.get('path',''))
+                     and (self._tool_for(_key(e)) == tid or any(h['tool_use_id']==tid for h in self._native_matches(e,completed=True)))]
+            evidence.extend(reads)
+            finding['consequential_evidence_ids'] = list(dict.fromkeys([*finding['consequential_evidence_ids'],*(e['event_id'] for e in reads)]))
+        # A sensitive read in an earlier tool is relevant context, not proof of
+        # payload transmission. Do not impose the former one-tool/60s boundary.
+        if kind == 'network_effect':
+            send_time = max(e['time'] for e in evidence if e['kind'] == 'network_send')
+            reads = [e for e in self.effects if e['kind'] == 'file_read' and _sensitive_path(e.get('path', ''))
+                     and e['time'] <= send_time and self._workspace_write(e)]
+            for read in reads[-8:]:
+                evidence.append(read)
+                finding.setdefault('causal_links', []).append({'relation': 'earlier_run_access',
+                    'evidence_id': read['event_id'], 'confidence': 'temporal_only_not_payload_flow'})
+                self.graph.edge(read['event_id'], finding['consequential_evidence_ids'][0],
+                                'earlier_run_access', 'temporal_only_not_payload_flow')
+        tids = {e.get('tool_use_id') for e in evidence if e.get('tool_use_id')}
+        if finding.get('tool_use_id'): tids.add(finding['tool_use_id'])
+        related, links, omitted = self.graph.related(evidence, tids)
+        state_updates = self.state_updates.get(finding['finding_id'], [])
+        evidence.extend(state_updates)
+        if state_updates:
+            finding['consequential_evidence_ids'] = list(dict.fromkeys([*finding['consequential_evidence_ids'],
+                *(e['event_id'] for e in state_updates)]))
+        for event in related:
+            if event['kind'] == 'external_evidence':
+                # These anchors resolve locally in the dashboard while retaining
+                # the original run/event/hash; they do not authenticate old logs.
+                if not hasattr(self, '_external_anchors'): self._external_anchors = set()
+                if event['event_id'] not in self._external_anchors:
+                    self.store.event('external_evidence', event)
+                    self._external_anchors.add(event['event_id'])
+            evidence.append(event)
+        evidence = sorted({e['event_id']: e for e in evidence}.values(), key=lambda e: (e['time'], e['event_id']))
+        candidate_time = min((e['time'] for e in evidence if e['event_id'] in finding['consequential_evidence_ids']), default=0)
+        for e in evidence:
+            if e['kind']=='permission' and e.get('action')=='approved':
+                e = dict(e)
+                e['valid_at_candidate_time'] = bool(e.get('approval_complete') and e['time']<=candidate_time<float(e.get('expires_at') or 0))
+                # An endpoint approval cannot be silently used for another endpoint.
+                endpoints = {x.get('endpoint') for x in evidence if x['event_id'] in finding['consequential_evidence_ids'] and x.get('endpoint')}
+                e['scope_matches_candidate'] = e.get('scope') in endpoints if endpoints else None
+                evidence = [e if x['event_id']==e['event_id'] else x for x in evidence]
+        ids = {e['event_id'] for e in evidence}
+        finding['causal_links'] = [*finding.get('causal_links', []),
+            *(link for link in links if link.get('evidence_id') in ids
+              and (not link.get('prior_evidence_id') or link['prior_evidence_id'] in ids))]
+        if omitted: gaps.append('bounded evidence subgraph omitted connected context; do not clear')
+        if kind in {'repository_state', 'outcome'}:
+            finding['attribution'] = 'host-observed-state' if kind == 'repository_state' else 'independent-check-and-agent-claim'
+            finding['episode_complete'] = not omitted
+            gaps = [g for g in gaps if not g.startswith(('PostToolUse missing', 'No unique completed tool attribution'))]
+        elif kind in {'sensitive_access', 'shared_resource_access', 'failed_attempt', 'network_effect'}:
+            # Re-evaluate resource/window attribution after all hook messages arrived.
+            effect = next((e for e in evidence if e['event_id'] in finding['consequential_evidence_ids']
+                           and e['kind'] in {'file_read', 'file_open', 'network_send', 'network'}), None)
+            if effect:
+                tid = self._tool_for(_key(effect))
+                matches = self._native_matches(effect, completed=True) if not tid and effect.get('path') else []
+                if not tid and len(matches) == 1: tid = matches[0]['tool_use_id']
+                pre = next((h for h in self.hooks if h['tool_use_id'] == tid), None)
+                post = self.post_hooks.get(tid)
+                if pre and post and tid not in self.ambiguous_tools:
+                    for h in (pre, post):
+                        if h['event_id'] not in ids: evidence.append({**h, 'kind': 'hook'})
+                    finding.update({'tool_use_id': tid, 'apparent_action': self._apparent(pre),
+                        'attribution': 'command-and-process-lineage' if pre.get('command') else 'hook-resource-time',
+                        'episode_complete': not omitted})
+                    gaps = [g for g in gaps if not g.startswith(('PostToolUse missing', 'No unique completed tool attribution'))]
+                elif matches or not tid:
+                    finding.update({'attribution': 'uncertain', 'episode_complete': False})
+        finding['evidence_ids'] = [e['event_id'] for e in evidence]
+        finding['coverage_gaps'] = list(dict.fromkeys(gaps))
+        return finding, evidence, finding['coverage_gaps']
 
     def _enrich(self, finding: dict, seed: list[dict]) -> None:
         # Alert immediately, but let the evidence stream and PostToolUse settle before judging.
         # A long-running tool is assessed after at most ten seconds with an explicit gap.
         deadline = time.monotonic() + self.evaluation_wait_seconds
         with self.changed:
+            while self.defer_evaluation and not self.finished:
+                self.changed.wait(timeout=.1)
             while not self.finished and time.monotonic() < deadline:
                 if finding["tool_use_id"] in self.post_hooks and time.monotonic() - self.last_arrival >= 0.5:
                     break
@@ -381,7 +666,8 @@ class Engine:
 
     def _assess(self, finding: dict, evidence_packet: dict, *, revision_number: int) -> None:
         try:
-            judgement = self.judge_fn(evidence_packet)
+            with self.judge_slots:
+                judgement = self.judge_fn(evidence_packet)
         except Exception as exc:
             judgement = {"status": "unavailable", "reason": type(exc).__name__}
         revision = {**finding, "revision": revision_number, "time": time.time(), "laya": judgement}
@@ -391,7 +677,8 @@ class Engine:
             revision["attribution"] = "uncertain"
             revision["coverage_gaps"] = list(dict.fromkeys([*revision["coverage_gaps"],
                 "attribution became ambiguous after the model packet was assembled"]))
-        if revision["attribution"] == "uncertain" or not finding["episode_complete"] or judgement.get("omitted_context_ids"):
+        uncertain = revision["attribution"] == "uncertain" or not finding["episode_complete"] or judgement.get("omitted_context_ids")
+        if uncertain and (not self.extended_analysis or revision['status'] == 'consistent_with_goal'):
             revision["status"] = "inconclusive" if judgement.get("status") in {"scored", "assessed"} else "evaluation_unavailable"
         revision["assessment_note"] = ("Assessment of observed metadata against the stated goal; not a confirmed violation or proof of safety. "
                                        "Threshold policy: review for unexplained effects >=0.6, mismatch >=0.75, or relevance <=0.25; "
@@ -400,32 +687,69 @@ class Engine:
             revision['assessment_note'] = ('Structured model verdict on observed effects and the authorised goal. '
                 'Complete tool context and unambiguous attribution are required to clear an episode; '
                 'no numerical risk score is inferred. This is not a confirmed violation or proof of safety.')
+        if evidence_packet.get('goal_complete') is False:
+            revision['status'] = 'inconclusive' if judgement.get('status') == 'assessed' else 'evaluation_unavailable'
+        if self.extended_analysis:
+            revision['is_alert'] = revision['status'] == 'review_required'
+            if judgement.get('assessment'): revision['assessment'] = judgement['assessment']
+            if judgement.get('claims'): revision['verified_claims'] = judgement['claims']
+            if judgement.get('title') and judgement.get('status') == 'assessed':
+                revision['title'] = redact(judgement['title'], 160)
+                revision['message'] = judgement['rationale']
         if judgement.get("status") not in {"scored", "assessed"}:
             revision["coverage_gaps"] = list(dict.fromkeys(
                 [*revision["coverage_gaps"], "Decision model judgement unavailable"]
             ))
-        self.store.finding(revision)
+        if self.extended_analysis:
+            self.store.assessment(revision)
+            if revision['is_alert']:
+                self.review_ids.add(finding['finding_id'])
+                if self.measure_latency and self.first_alert_latency is None:
+                    times = [e['timestamp_seconds'] for e in evidence_packet['evidence']
+                             if e['evidence_id'] in evidence_packet['consequential_evidence_ids']]
+                    if times: self.first_alert_latency = revision['time'] - min(times)
+            else: self.review_ids.discard(finding['finding_id'])
+            self.counts['finding'] = len(self.review_ids)
+        else: self.store.finding(revision)
         self.store.evaluations.append({"finding_id": finding["finding_id"], "revision": revision_number,
                                        "time": revision["time"], "packet": evidence_packet,
                                        "judgement": judgement, "disposition": revision["status"]})
-        self.alert_fn(revision)
+        self.assessed_packets[finding['finding_id']] = (revision_number, evidence_packet)
+        if not self.extended_analysis or revision.get('is_alert'): self.alert_fn(revision)
 
     def finish(self) -> None:
         if self.counts.get("hook", 0) == 0:
             self.add_gap("no Codex hooks received; combined hook/runtime coverage was not achieved")
-        unmatched = {hook["tool_use_id"] for hook in self.hooks if hook.get("tool_use_id")}
+        unmatched = {hook["tool_use_id"] for hook in self.hooks if hook.get("tool_use_id") and hook.get("command")}
         unmatched.difference_update(self.links.values())
         unmatched.difference_update(self.ambiguous_tools)
         if unmatched:
             self.add_gap(f"{len(unmatched)} shell tool hook(s) lacked a process attribution")
+        if self.graph:
+            for e in self.effects:
+                tid = self._tool_for(_key(e))
+                if not tid and e['kind'] in {'file_read', 'file_write'}:
+                    matches = self._native_matches(e, completed=True)
+                    if len(matches) == 1: tid = matches[0]['tool_use_id']
+                self.graph.add({**e, 'tool_use_id': tid})
         with self.changed:
             self.finished = True
             self.changed.notify_all()
-        deadline = time.monotonic() + 125  # at most two sixty-second model requests
+        deadline = time.monotonic() + max(125, 65 * len(self.threads))
         for thread in self.threads:
             thread.join(timeout=max(0, deadline - time.monotonic()))
             if thread.is_alive():
                 self.add_gap("evaluation worker did not finish before shutdown")
+        if self.graph:
+            for fid, states in self.state_updates.items():
+                revision, previous_packet = self.assessed_packets.get(fid, (1, {}))
+                previous_ids = {e['evidence_id'] for e in previous_packet.get('evidence', [])}
+                if any(e['event_id'] not in previous_ids for e in states) and not any(t.is_alive() for t in self.threads):
+                    original, seed = self.candidate_seeds[fid]
+                    updated, final_packet = self._episode(original, seed)
+                    self._assess(updated, final_packet, revision_number=revision + 1)
+        # Keep graph handles alive if an overdue daemon is still auditing.
+        if self.graph and not any(thread.is_alive() for thread in self.threads): self.graph.close()
 
     def summary(self) -> dict:
         return {
@@ -436,5 +760,6 @@ class Engine:
             "linked_tool_processes": len(self.links),
             "ambiguous_tool_attributions": len(self.ambiguous_tools),
             "finding_count": self.counts.get("finding", 0),
+            "assessment_count": self.counts.get('investigation', 0),
             "interpretation": "No finding means no suspicious behaviour observed within stated coverage, not proof of safety.",
         }

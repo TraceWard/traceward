@@ -15,6 +15,8 @@ from .privacy import redact
 
 SCHEMA_VERSION = "1.8.0"
 CLASSES = {
+    **{kind: (0, "Base Event", 0, "Uncategorized", 99, "Other") for kind in
+       ('context', 'agent_claim', 'file_state', 'permission', 'independent_validation', 'external_evidence', 'assessment')},
     "hook": (0, "Base Event", 0, "Uncategorized", 99, "Other"),
     "coverage": (0, "Base Event", 0, "Uncategorized", 99, "Other"),
     "process_exit": (1007, "Process Activity", 1, "System Activity", 2, "Terminate"),
@@ -71,7 +73,7 @@ def project(kind: str, item: dict, run_id: str) -> dict:
         record["process"] = proc
         record["unmapped"]["traceward"]["script_paths"] = [redact(path, 256) for path in item.get("script_paths", [])[:8]]
         record["actor"] = {"process": {"pid": int(item.get("parent_pid") or item["pid"])}}
-    elif kind.startswith("file_"):
+    elif kind in {'file_open', 'file_read', 'file_write'}:
         record["actor"] = {"process": {"pid": int(item["pid"])}}
         record["file"] = {"path": redact(item["path"], 512),
                           "name": redact(os.path.basename(item["path"]), 255),
@@ -97,7 +99,7 @@ def project(kind: str, item: dict, run_id: str) -> dict:
             record["unmapped"]["traceward"]["byte_count"] = int(item["bytes"])
     elif kind == "finding":
         record["finding_info"] = {"uid": item["finding_id"], "title": item["title"]}
-        record["is_alert"] = item.get("status") not in {"consistent_with_goal"}
+        record["is_alert"] = item.get('is_alert', item.get("status") not in {"consistent_with_goal"})
         if not record["is_alert"]:
             record["severity_id"] = 1
         record["message"] = redact(item["message"], 1000)
@@ -106,6 +108,9 @@ def project(kind: str, item: dict, run_id: str) -> dict:
         )
     else:
         record["message"] = redact(item.get("message", kind), 1000)
+        if kind in {'context', 'agent_claim', 'file_state', 'permission', 'independent_validation', 'external_evidence', 'assessment'}:
+            record['unmapped']['traceward']['details'] = {
+                k: v for k, v in item.items() if k not in {'event_id', 'kind', 'time', 'raw_args'} and not k.startswith('_')}
         if kind == "hook":
             record["unmapped"]["traceward"].update(
                 {"tool_use_id": item.get("tool_use_id"), "tool_name": item.get("tool_name"),
@@ -149,10 +154,14 @@ class JsonlWriter:
 
 class EvidenceStore:
     def __init__(self, run_dir: Path, run_id: str):
+        self.run_dir = run_dir
         self.run_id = run_id
         self.events = JsonlWriter(run_dir / "events.jsonl")
         self.findings = JsonlWriter(run_dir / "findings.jsonl")
+        self.assessments = JsonlWriter(run_dir / 'assessments.jsonl')
+        self.active_findings = set()
         self.evaluations = JsonlWriter(run_dir / "evaluations.jsonl")
+        self.observations = JsonlWriter(run_dir / 'analysis-events.jsonl')
 
     def event(self, kind: str, item: dict) -> dict:
         record = project(kind, item, self.run_id)
@@ -163,4 +172,17 @@ class EvidenceStore:
     def finding(self, item: dict) -> dict:
         record = self.event("finding", item)
         self.findings.append(item)
+        return record
+
+    def assessment(self, item: dict) -> dict:
+        """Internal investigation history; only review dispositions emit findings."""
+        self.assessments.append(item)
+        record = self.event('assessment', {k:v for k,v in item.items() if k in
+            {'finding_id','revision','time','title','status','is_alert','candidate_kind','evidence_ids'}})
+        if item.get('status') == 'review_required':
+            self.finding(item)
+            self.active_findings.add(item['finding_id'])
+        elif item['finding_id'] in self.active_findings:
+            self.finding({**item, 'status':'withdrawn', 'assessment_disposition':item['status'], 'is_alert':False})
+            self.active_findings.discard(item['finding_id'])
         return record

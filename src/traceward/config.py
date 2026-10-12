@@ -10,7 +10,7 @@ OBSERVER_KEYS = {"UNSLOTH_TOKEN", "TRACEWARD_LAYA_URL", "TRACEWARD_LAYA_MODEL",
                  "TRACEWARD_JUDGE_PROVIDER", "TRACEWARD_JUDGE_URL", "TRACEWARD_JUDGE_MODEL", "TRACEWARD_JUDGE_TOKEN"}
 
 
-def load_observer_env(path: Path | None = None) -> None:
+def load_observer_env(path: Path | None = None, *, extra_keys=()) -> None:
     """Environment wins; otherwise load TraceWard's checkout .env, not the cwd.
 
     Installed users can select an exact file via TRACEWARD_ENV_FILE. Never
@@ -32,7 +32,7 @@ def load_observer_env(path: Path | None = None) -> None:
             line = line[7:].lstrip()
         key, separator, value = line.partition("=")
         key = key.strip()
-        if not separator or key not in OBSERVER_KEYS or key in os.environ:
+        if not separator or key not in OBSERVER_KEYS | set(extra_keys) or key in os.environ:
             continue
         try:
             parts = shlex.split(value, comments=True)

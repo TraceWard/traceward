@@ -10,7 +10,7 @@ from urllib.request import Request, urlopen
 
 from .laya import judge as laya_judge, model_input
 from .privacy import redact
-from .structured import request_payload, strict_object, validate_response
+from .structured import request_payload, strict_object, validate_response, factual_predicates
 
 DEFAULT_MODEL = 'qwen/qwen3.8-27b'
 DEFAULT_URL = 'http://127.0.0.1:1234/v1/chat/completions'
@@ -44,11 +44,15 @@ def endpoint(value):
 def generative_judge(packet, *, url=None, model=None, timeout=60):
     selected_model = model or os.environ.get('TRACEWARD_JUDGE_MODEL', DEFAULT_MODEL)
     selected_url = endpoint(url or os.environ.get('TRACEWARD_JUDGE_URL', DEFAULT_URL))
-    rendered = model_input(packet, max_state_bytes=8192)
-    body = request_payload(rendered.get('state', ''), selected_model)
+    enriched = packet.get('packet_version', 2) >= 3
+    rendered = model_input(packet, max_state_bytes=12288 if enriched else 8192)
+    visible_aliases = {a:eid for a,eid in rendered.get('evidence_aliases',{}).items()
+                       if eid in rendered.get('represented_evidence_ids',[])}
+    facts = factual_predicates(packet.get('evidence',[]),visible_aliases,packet.get('consequential_evidence_ids',[])) if enriched else None
+    body = request_payload(rendered.get('state', ''), selected_model, enriched=enriched, facts=facts,evidence_aliases=visible_aliases)
     encoded = json.dumps(body).encode()
     started = time.monotonic()
-    provenance = {'provider': 'lmstudio', 'contract_version': 'goal-effects-v2',
+    provenance = {'provider': 'lmstudio', 'contract_version': 'goal-effects-v4' if enriched else 'goal-effects-v3',
         'endpoint': selected_url, 'requested_model': selected_model, 'model': selected_model,
         'request_sha256': hashlib.sha256(encoded).hexdigest(), 'request': body,
         'model_input': rendered, 'question_contract': body['response_format'],
@@ -58,6 +62,8 @@ def generative_judge(packet, *, url=None, model=None, timeout=60):
                 'latency_seconds': round(time.monotonic()-started, 3), **extra}
     if rendered['status'] != 'ready':
         return unavailable('required_evidence_exceeds_input_budget' if rendered['status'] != 'missing_evidence' else 'missing_consequential_evidence')
+    if enriched and len(body['messages'][1]['content'].encode()) > 14336:
+        return unavailable('verified_predicates_exceed_input_budget')
     headers = {'Content-Type': 'application/json'}
     token = os.environ.get('TRACEWARD_JUDGE_TOKEN')
     if token:
@@ -77,17 +83,23 @@ def generative_judge(packet, *, url=None, model=None, timeout=60):
     try:
         if result['model'] != selected_model:
             return unavailable('returned_model_mismatch', returned_model=redact(str(result.get('model')), 128))
-        visible_aliases = {a: eid for a, eid in rendered['evidence_aliases'].items()
-                           if re.search(r'\b'+re.escape(a)+r'\b', rendered['state'])}
-        answer = validate_response(result, visible_aliases)
+        answer = validate_response(result, visible_aliases, enriched=enriched, evidence=packet.get('evidence', []),facts=facts)
         required = set(packet.get('consequential_evidence_ids', []))
         cited = [visible_aliases[a] for a in answer['evidence_ids']]
         if required and not required.intersection(cited):
             return unavailable('no_consequential_evidence_cited')
+        if enriched:
+            claims = [visible_aliases[a] for fid in answer['claims'] for a in facts[fid]['evidence_ids']]
+            if not required.intersection(claims): return unavailable('no_typed_claim_cites_consequential_evidence')
     except (KeyError, IndexError, TypeError, ValueError):
         return unavailable('invalid_structured_answer')
     return {'status': 'assessed', **provenance, 'returned_model': result['model'],
         'answer': sanitized(answer),
+        **({'title': redact(answer['title'], 160), 'assessment': {name: {**sanitized(facet),
+            'evidence_ids': [visible_aliases[a] for a in facet['evidence_ids']]}
+            for name, facet in answer['assessment'].items()},
+            'claims': [{'fact_type': facts[fid]['fact_type'], 'evidence_ids': [visible_aliases[a] for a in facts[fid]['evidence_ids']]}
+                       for fid in answer['claims']], 'factual_predicates': facts} if enriched else {}),
         'disposition': answer['disposition'], 'rationale': redact(answer['rationale'], 8000),
         'cited_evidence_ids': cited, 'omitted_context_ids': rendered.get('omitted_context_ids', []),
         'uncalibrated_risk_score': None, 'latency_seconds': round(time.monotonic()-started, 3),

@@ -166,7 +166,7 @@ class RunIndex:
                 summary = _read_json(path / "summary.json")
                 updated = max((p.stat().st_mtime for p in
                                (path / "run.json", path / "summary.json", path / "events.jsonl",
-                                path / "findings.jsonl") if p.is_file() and not p.is_symlink()),
+                                path / "findings.jsonl", path / 'assessments.jsonl') if p.is_file() and not p.is_symlink()),
                               default=path.stat().st_mtime)
                 old = self.db.execute("SELECT manifest,summary,updated_at FROM runs WHERE run_id=?",
                                       (run_id,)).fetchone()
@@ -180,6 +180,7 @@ class RunIndex:
                     changed = True
                 changed |= self._ingest(run_id, path / "events.jsonl", "events.jsonl")
                 changed |= self._ingest(run_id, path / "findings.jsonl", "findings.jsonl")
+                changed |= self._ingest(run_id, path / 'assessments.jsonl', 'assessments.jsonl')
             self.db.commit()
             if changed:
                 self.revision += 1
@@ -198,8 +199,10 @@ class RunIndex:
           ORDER BY time_s DESC, revision DESC LIMIT 1""", (row["run_id"],)).fetchone()
         finding_title = (json.loads(latest_finding["body"]).get("title")
                          if latest_finding else None)
-        assessments = self.findings(row["run_id"])
-        review_count = sum(f.get("status") != "consistent_with_goal" for f in assessments)
+        assessments = self.assessments(row["run_id"])
+        reviews = [f for f in assessments if f.get('status') == 'review_required']
+        review_count = len(reviews)
+        finding_title = reviews[0]['title'] if reviews else None
         if not assessments:
             evaluation_label = "No consequential episode assessed"
         elif any("demo" in f.get("laya", {}).get("model", "") or f.get("laya", {}).get("evaluation_source") == "simulated" for f in assessments):
@@ -213,7 +216,7 @@ class RunIndex:
         return {"run_id": row["run_id"], "goal": manifest.get("goal") or (summary or {}).get("goal") or "Goal unavailable",
                 "started_at": manifest.get("started_at") or row["updated_at"], "updated_at": row["updated_at"],
                 "status": status, "summary": summary, "event_counts": {r["kind"]: r["n"] for r in counts},
-                "finding_count": findings, "finding_title": finding_title,
+                "finding_count": review_count, "assessment_count": len(assessments), "finding_title": finding_title,
                 "review_count": review_count, "evaluation_label": evaluation_label,
                 "source": manifest.get("source", "unknown"), "demo_case": manifest.get("demo_case"),
                 "legacy": manifest.get("observer_version") not in {"assessment-v2", "gvisor-v1"},
@@ -254,7 +257,7 @@ class RunIndex:
             return {"events": [{"index_id": row["id"], **json.loads(row["body"])} for row in reversed(rows)],
                     "next_before": rows[-1]["id"] if rows and has_more else None}
 
-    def findings(self, run_id: str) -> list[dict]:
+    def assessments(self, run_id: str) -> list[dict]:
         with self.lock:
             rows = self.db.execute("""SELECT f.body FROM findings f JOIN
               (SELECT finding_id,MAX(revision) revision FROM findings WHERE run_id=? GROUP BY finding_id) latest
@@ -268,6 +271,9 @@ class RunIndex:
                 finding["revisions"] = [json.loads(rev["body"]) for rev in revisions]
                 results.append(finding)
             return results
+
+    def findings(self, run_id: str) -> list[dict]:
+        return [f for f in self.assessments(run_id) if f.get('status') == 'review_required']
 
     def processes(self, run_id: str) -> list[dict]:
         with self.lock:
@@ -389,6 +395,12 @@ def create_app(index: RunIndex, assets: Path | None = None):
         index.refresh()
         required_run(run_id)
         return {"processes": index.processes(run_id)}
+
+    @app.get('/api/runs/{run_id}/assessments')
+    def assessments(run_id: str):
+        index.refresh()
+        required_run(run_id)
+        return {'assessments': index.assessments(run_id)}
 
     @app.get("/api/runs/{run_id}/evaluations")
     def evaluations(run_id: str):

@@ -36,6 +36,9 @@ def revision(mode:str):
     'laya':{'status':'assessed','model':'demo-structured-qwen','provider':'synthetic-regression',
       'disposition':'consistent_with_goal','rationale':'The synthetic goal explicitly requests these fixture operations.',
       'cited_evidence_ids':['file-299','send'],'semantic_accuracy_validated':False}})
+  final['assessment']={name:{'status':'supported','summary':'Synthetic supported context','evidence_ids':['send']}
+      for name in ('relevance','authority','integrity','outcome','benign_explanation','missing_evidence')}
+  final['verified_claims']=[{'fact_type':'observed_operation','evidence_ids':['send']}]
  store.finding(final)
  store.evaluations.append({'finding_id':base['finding_id'],'revision':final['revision'],'packet':{'goal':'Synthetic browser regression','evidence_ids':base['evidence_ids'],'causal_links':[{'parent':'shell','child':'child'}]},'judgement':final['laya']})
  (folder/'summary.json').write_text(json.dumps({'goal':'Synthetic browser regression','codex_exit_code':0,'coverage_gaps':['Synthetic regression coverage gap','collector connection lost (synthetic test)']}))

@@ -63,6 +63,7 @@ class DashboardTests(unittest.TestCase):
         first = {"finding_id": "finding-1", "revision": 1, "time": 100,
                  "title": "Review", "evidence_ids": ["evidence"], "uncalibrated_risk_score": None}
         second = {**first, "revision": 2, "time": 101, "uncalibrated_risk_score": 0.8,
+                  "status": "review_required",
                   "laya": {"status": "scored", "not_a_probability": True}}
         (self.run_dir / "findings.jsonl").write_text(json.dumps(first) + "\n" + json.dumps(second) + "\n")
         findings = self.client.get(f"/api/runs/{self.run_id}/findings").json()["findings"]
@@ -83,6 +84,24 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(self.client.get(path + "&source=../../etc/passwd").status_code, 404)
         self.assertEqual(self.client.get("/api/runs/not-a-uuid/events").status_code, 404)
         self.assertNotIn("secret argument", json.dumps(self.client.get(f"/api/runs/{self.run_id}").json()))
+
+    def test_cleared_assessment_is_not_a_finding_and_withdraws_prior_review(self):
+        from traceward.ocsf import EvidenceStore
+        store=EvidenceStore(self.run_dir,self.run_id)
+        first={'finding_id':'candidate','revision':1,'time':100,'title':'Private file access',
+               'message':'Observed read','status':'review_required','is_alert':True,'evidence_ids':[]}
+        store.assessment(first)
+        self.assertEqual(len(self.client.get(f'/api/runs/{self.run_id}/findings').json()['findings']),1)
+        store.assessment({**first,'revision':2,'time':101,'status':'consistent_with_goal','is_alert':False})
+        self.assertEqual(self.client.get(f'/api/runs/{self.run_id}/findings').json()['findings'],[])
+        audit=self.client.get(f'/api/runs/{self.run_id}/assessments').json()['assessments']
+        self.assertEqual(audit[0]['status'],'consistent_with_goal')
+        self.assertEqual(len(audit[0]['revisions']),2)
+        run=self.client.get(f'/api/runs/{self.run_id}').json()
+        self.assertEqual(run['finding_count'],0);self.assertIsNone(run['finding_title'])
+        self.assertEqual(run['assessment_count'],1)
+        rows=[json.loads(x) for x in (self.run_dir/'findings.jsonl').read_text().splitlines()]
+        self.assertEqual([r['status'] for r in rows],['review_required','withdrawn'])
 
     def test_cross_origin_and_host_rejected(self):
         self.assertEqual(self.client.get("/api/runs", headers={"Host": "attacker.example"}).status_code, 403)

@@ -16,6 +16,7 @@ type Run = {
   summary: Summary | null;
   event_counts: Record<string, number>;
   finding_count: number;
+  assessment_count?: number;
   review_count?: number;
   evaluation_label?: string;
   source?: string;
@@ -58,6 +59,7 @@ type Event = {
       errno?: number;
       result?: number;
       exit_status?: number;
+      details?: Record<string, unknown>;
     };
   };
 };
@@ -76,6 +78,9 @@ type Finding = {
   coverage_gaps: string[];
   uncalibrated_risk_score: number | null;
   assessment_note?: string;
+  is_alert?: boolean;
+  assessment?: Record<string, {status: string; summary: string; evidence_ids: string[]}>;
+  verified_claims?: {fact_type: string; evidence_ids: string[]}[];
   laya?: {
     status: string;
     reason?: string;
@@ -111,6 +116,11 @@ const kind = (event: Event) => {
 };
 const eventTitle = (event: Event) => {
   const meta = event.unmapped?.traceward;
+  const detail = meta?.details;
+  if (kind(event) === 'file_state') return `${String(detail?.change || detail?.phase || 'Observed state')} · ${String(detail?.path || 'repository file')}`;
+  if (kind(event) === 'context' || kind(event) === 'agent_claim') return `${String(detail?.role || 'Captured context')} · ${String(detail?.source_reference || detail?.source || '')}`;
+  if (kind(event) === 'permission') return `${String(detail?.action || 'Permission evidence')} · ${String(detail?.scope || 'scope unknown')}`;
+  if (kind(event) === 'independent_validation') return detail?.passed === true ? 'Independent validation passed' : detail?.passed === false ? 'Independent validation failed' : 'Independent validation unavailable';
   const outcome = meta?.operation_status === "failed" ? "Failed attempt · " : meta?.operation_status === "pending" ? "Pending connection · " : "";
   if (kind(event) === "hook")
     return `${meta?.hook_event || "Hook"} · ${meta?.apparent_command || "tool call"}`;
@@ -152,6 +162,7 @@ export default function App() {
   const [events, setEvents] = useState<Event[]>([]);
   const [processes, setProcesses] = useState<Event[]>([]);
   const [findings, setFindings] = useState<Finding[]>([]);
+  const [assessmentAudit, setAssessmentAudit] = useState(false);
   const [evidence, setEvidence] = useState<Event[]>([]);
   const [selectedFinding, setSelectedFinding] = useState<string>("");
   const [selectedEvent, setSelectedEvent] = useState<Event | null>(null);
@@ -186,7 +197,7 @@ export default function App() {
         get<{ events: Event[]; next_before: number | null }>(
           `/api/runs/${runId}/events?limit=250`,
         ),
-        get<{ findings: Finding[] }>(`/api/runs/${runId}/findings`),
+        get<{ findings?: Finding[]; assessments?: Finding[] }>(`/api/runs/${runId}/${assessmentAudit ? 'assessments' : 'findings'}`),
         get<{ processes: Event[] }>(`/api/runs/${runId}/processes`),
         get<{ evaluations: typeof evaluations }>(`/api/runs/${runId}/evaluations`),
       ]);
@@ -197,19 +208,20 @@ export default function App() {
       });
       setProcesses(processData.processes);
       setOlder(current => paginationStarted.current ? current : eventData.next_before);
-      setFindings(findingData.findings);
+      const visible = findingData.assessments ?? findingData.findings ?? [];
+      setFindings(visible);
       setEvaluations(evaluationData.evaluations);
       setLoadedRun(runId);
       setSelectedFinding((current) =>
-        current && findingData.findings.some((f) => f.finding_id === current)
+        current && visible.some((f) => f.finding_id === current)
           ? current
-          : findingData.findings[0]?.finding_id || "",
+          : visible[0]?.finding_id || "",
       );
       setError("");
     } catch (exc) {
       setError(`Cannot read run: ${String(exc)}`);
     }
-  }, [runId]);
+  }, [runId, assessmentAudit]);
   useEffect(() => {
     void loadRuns();
     const stream = new EventSource("/api/stream");
@@ -461,9 +473,9 @@ export default function App() {
                 <small>Confirmed reads / writes</small>
               </div>
               <div className={`metric ${run.finding_count ? "highlight" : ""}`}>
-                <span>OBSERVED EPISODES</span>
+                <span>FINDINGS</span>
                 <strong>{run.finding_count}</strong>
-                <small>{run.review_count ?? run.finding_count} pending / review / inconclusive</small>
+                <small>{run.assessment_count ?? run.finding_count} internal assessments</small>
               </div>
             </div>
             <div className="workspace-grid">
@@ -601,9 +613,12 @@ export default function App() {
                     <h2>
                       {selectedEvent
                         ? "Event details"
-                        : "Findings & evaluation"}
+                        : assessmentAudit ? 'Assessment audit' : 'Findings'}
                     </h2>
                   </div>
+                  {!selectedEvent && <button type="button" onClick={() => {
+                    setFindings([]); setSelectedFinding(''); setAssessmentAudit(current => !current);
+                  }}>{assessmentAudit ? 'Back to findings' : 'Assessment audit'}</button>}
                   {selectedEvent && (
                     <button
                       className="close"
@@ -651,6 +666,10 @@ export default function App() {
                     {selectedEvent.unmapped?.traceward?.operation_status && <div className="detail-pair"><span>Operation outcome</span><b>{selectedEvent.unmapped.traceward.operation_status}{selectedEvent.unmapped.traceward.errno ? ` · errno ${selectedEvent.unmapped.traceward.errno}` : ""}</b></div>}
                     {selectedEvent.unmapped?.traceward?.byte_count !== undefined && <div className="detail-pair"><span>Observed bytes</span><b>{selectedEvent.unmapped.traceward.byte_count}</b></div>}
                     {selectedEvent.unmapped?.traceward?.process_key && <div className="detail-pair"><span>Process identity</span><code>{selectedEvent.unmapped.traceward.process_key}</code></div>}
+                    {selectedEvent.unmapped?.traceward?.details && <div className="semantic-evidence">
+                      <div className="section-label">SOURCE EVIDENCE</div>
+                      <pre className="evaluation-json">{JSON.stringify(selectedEvent.unmapped.traceward.details, null, 2)}</pre>
+                    </div>}
                     {rawLine && (
                       <button
                         className="raw-button"
@@ -695,7 +714,7 @@ export default function App() {
                           <>
                             <div className="finding-alert" data-status={finding.status} data-revision={finding.revision}>
                               <span className="finding-badge">
-                                {(finding.status === "suspicious_behaviour" ? "legacy provisional alert" : finding.status).replaceAll("_", " ").toUpperCase()}
+                                {(finding.status === 'provisional' && finding.is_alert === false ? 'Investigation candidate' : finding.status === "suspicious_behaviour" ? "legacy provisional alert" : finding.status).replaceAll("_", " ").toUpperCase()}
                               </span>
                               <h3>{finding.title}</h3>
                               <p>{finding.message}</p>
@@ -717,6 +736,20 @@ export default function App() {
                                   <span className="score-tag">{finding.laya.model?.includes("demo") ? "SIMULATED EVALUATOR" : "STRUCTURED MODEL REVIEW"}</span>
                                 </div>
                                 <p className="judge-rationale">{finding.laya.rationale}</p>
+                                {finding.assessment && <div className="assessment-facets">
+                                  {Object.entries(finding.assessment).map(([name, facet]) => <section key={name} className="assessment-facet" data-status={facet.status}>
+                                    <div><strong>{name.replaceAll('_', ' ')}</strong><span>{facet.status.replaceAll('_', ' ')}</span></div>
+                                    <p>{facet.summary}</p>
+                                    <div className="judge-citations">{facet.evidence_ids.map(id => {
+                                      const item = evidence.find(e => e.metadata.uid === id);
+                                      return <button key={id} disabled={!item} onClick={() => item && setSelectedEvent(item)} aria-label={`${name} evidence ${id}`}>{short(id, 12)}</button>;
+                                    })}</div>
+                                  </section>)}
+                                </div>}
+                                {finding.verified_claims?.length ? <div className="supported-facts"><strong>Evidence predicates checked</strong>
+                                  <ul>{finding.verified_claims.map((claim, i) => <li key={i}>{claim.fact_type.replaceAll('_', ' ')} · {claim.evidence_ids.map(id => short(id)).join(', ')}</li>)}</ul>
+                                  <p>These checks validate typed evidence predicates; model interpretations can still be wrong.</p>
+                                </div> : null}
                                 <div className="judge-citations">{finding.laya.cited_evidence_ids?.map(id => {
                                   const item = evidence.find(e => e.metadata.uid === id);
                                   return <button key={id} disabled={!item} onClick={() => item && setSelectedEvent(item)} aria-label={`Judge evidence ${id}`}>{short(id, 16)}</button>;
@@ -851,10 +884,10 @@ export default function App() {
                       </>
                     ) : (
                       <div className="no-findings">
-                        <div>✓</div>
-                        <h3>{loadedRun === runId ? "No review findings" : "Loading assessment…"}</h3>
+                        <div>—</div>
+                        <h3>{loadedRun === runId ? assessmentAudit ? 'No assessments' : "No review findings" : "Loading assessment…"}</h3>
                         <p>
-                          {loadedRun === runId ? "Nothing suspicious was detected within this run’s coverage. This does not prove the agent was safe." : "Loading evidence. No conclusion is available yet."}
+                          {loadedRun === runId ? "Cleared and incomplete assessments are available in Assessment audit. No finding is not proof of safety." : "Loading evidence. No conclusion is available yet."}
                         </p>
                       </div>
                     )}

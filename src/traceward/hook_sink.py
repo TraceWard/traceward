@@ -11,6 +11,8 @@ import time
 from pathlib import Path
 
 from .privacy import redact
+from .state import content_redact
+from .context import text_content
 
 
 def compact_hook(payload: dict) -> dict:
@@ -23,7 +25,7 @@ def compact_hook(payload: dict) -> dict:
     patch = tool_input.get("patch", "")
     file_targets = (re.findall(r"^\*\*\* (?:Add|Update|Delete|Move to) File: (.+)$", patch, re.MULTILINE)
                     if isinstance(patch, str) else [])
-    return {
+    item = {
         "source": "codex_hook",
         "time": time.time(),
         "event": payload.get("hook_event_name"),
@@ -39,6 +41,9 @@ def compact_hook(payload: dict) -> dict:
         "result_status": redact(response_meta["status"], 32) if isinstance(response_meta.get("status"), str) else None,
         "result_exit_code": response_meta.get("exit_code") if isinstance(response_meta.get("exit_code"), int) else None,
     }
+    if os.environ.get('TRACEWARD_CONTEXT_MODE') == 'redacted' and response is not None:
+        item['response_excerpt'] = content_redact(text_content(response))
+    return item
 
 
 def main() -> int:

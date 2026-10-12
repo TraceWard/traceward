@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "traceward-pi-eval"
+version = "0.2.0"
+description = "Optional Pi agent evaluation harness for TraceWard"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["traceward==0.2.0"]
+
+[project.scripts]
+traceward-pi = "traceward_pi.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["traceward_pi"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"image" = "traceward_pi/image"

@@ -3,9 +3,12 @@ const id='11111111-1111-4111-8111-111111111111';
 test('JSONL revisions, views, chronology, pagination and evidence survive reopening',async({page,request})=>{
  await page.goto('/');
  await page.locator(`[data-run-id="${id}"]`).click();
+ await expect(page.locator('.finding-alert')).toHaveCount(0);
+ await page.getByRole('button',{name:'Assessment audit',exact:true}).click();
  await expect(page.locator('.finding-alert')).toHaveAttribute('data-revision','1');
  await request.post('/test/revision/scored');
  await expect(page.locator('.finding-alert')).toHaveAttribute('data-revision','2');
+ await page.getByRole('button',{name:'Back to findings',exact:true}).click();
  await expect(page.locator('.finding-tabs button')).toHaveCount(1);
  await expect(page.locator('.score-card')).toContainText('83');
  await expect(page.locator('.score-tag')).toHaveText('SIMULATED EVALUATOR');
@@ -47,6 +50,8 @@ test('unavailable model and collector loss stay visible',async({page,request})=>
  await request.post('/test/revision/unavailable');
  await page.goto('/');
  await page.locator(`[data-run-id="${id}"]`).click();
+ await expect(page.locator('.finding-alert')).toHaveCount(0);
+ await page.getByRole('button',{name:'Assessment audit',exact:true}).click();
  await expect(page.locator('.finding-alert')).toHaveAttribute('data-status','inconclusive');
  await expect(page.locator('.model-unavailable')).toContainText('fixture_outage');
  await expect(page.locator('.score-card')).toHaveCount(0);
@@ -56,6 +61,10 @@ test('structured verdict replaces prior content without inventing a score',async
  await request.post('/test/revision/structured');
  await page.goto('/');
  await page.locator(`[data-run-id="${id}"]`).click();
+ await expect(page.locator('.finding-alert')).toHaveCount(0);
+ const findings=await request.get(`/api/runs/${id}/findings`);
+ expect((await findings.json()).findings).toEqual([]);
+ await page.getByRole('button',{name:'Assessment audit',exact:true}).click();
  await expect(page.locator('.finding-alert')).toHaveAttribute('data-revision','4');
  await expect(page.locator('.finding-tabs button')).toHaveCount(1);
  await expect(page.locator('.structured-assessment')).toContainText('consistent with goal');
@@ -71,5 +80,9 @@ test('structured verdict replaces prior content without inventing a score',async
  expect(JSON.parse(await page.locator('.evaluation-json').innerText())).toEqual((await audit.json()).evaluations);
  await page.reload();
  await page.locator(`[data-run-id="${id}"]`).click();
+ await expect(page.locator('.finding-alert')).toHaveCount(0);
+ await page.getByRole('button',{name:'Assessment audit',exact:true}).click();
  await expect(page.locator('.judge-rationale')).toContainText('explicitly requests');
+ await expect(page.locator('.assessment-facet')).toHaveCount(6);
+ await expect(page.locator('.supported-facts')).toContainText('observed operation');
 });

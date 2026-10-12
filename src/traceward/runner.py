@@ -165,7 +165,7 @@ class Receiver:
         self.path.unlink(missing_ok=True)
 
 
-def supervise(request_path: Path) -> int:
+def supervise(request_path: Path, *, services_factory=None) -> int:
     request = json.loads(request_path.read_text())
     request_path.unlink()  # includes transient agent arguments/env, not evidence
     output = request_path.parent
@@ -179,18 +179,17 @@ def supervise(request_path: Path) -> int:
     if not (rootfs / "usr/local/bin/python3").exists():
         raise RuntimeError("guest image requires /usr/local/bin/python3 for trusted hooks")
     fixture_server = None
-    if request.get("fixture_receiver"):
+    services = services_factory(request, output) if services_factory else []
+    if request.get('fixture_receiver') and not services_factory:
         from http.server import BaseHTTPRequestHandler, HTTPServer
         class Discard(BaseHTTPRequestHandler):
             def do_POST(self):
-                length = min(max(int(self.headers.get("Content-Length", "0")), 0), 65536)
-                self.rfile.read(length)  # synthetic fixture only, never persisted
-                self.send_response(204)
-                self.end_headers()
-            def log_message(self, *_):
-                pass
-        fixture_server = HTTPServer(("127.0.0.1", 8800), Discard)
-        threading.Thread(target=fixture_server.serve_forever, daemon=True).start()
+                length = min(max(int(self.headers.get('Content-Length','0')),0),65536)
+                self.rfile.read(length)
+                self.send_response(204); self.end_headers()
+            def log_message(self, *_): pass
+        fixture_server = HTTPServer(('127.0.0.1',8800),Discard)
+        threading.Thread(target=fixture_server.serve_forever,daemon=True).start()
     with tempfile.TemporaryDirectory(prefix="tw-", ignore_cleanup_errors=True) as directory:
         tmp = Path(directory)
         receiver = Receiver(tmp / "events.sock", output / "raw.gvisor.jsonl", sandbox)
@@ -215,7 +214,8 @@ def supervise(request_path: Path) -> int:
         launch.mkdir(mode=0o755)
         (launch / "command.json").write_text(json.dumps(request["command"]))
         (launch / "command.json").chmod(0o644)
-        home_mount = next(source for source, target, _ in request["guest_mounts"] if target == "/codex-home")
+        home_mount = next(source for source, target, _ in request["guest_mounts"]
+                          if target == request.get('home_target', '/codex-home'))
         proc.update({"args": ["/usr/local/bin/python3", "/opt/traceward-hooks/traceward/guest_start.py"], "cwd": request["cwd"],
                      "env": [f"{k}={v}" for k, v in request["env"].items()],
                      "user": {"uid": os.stat(home_mount).st_uid,
@@ -305,6 +305,9 @@ def supervise(request_path: Path) -> int:
             if fixture_server:
                 fixture_server.shutdown()
                 fixture_server.server_close()
+            for service in services:
+                service.shutdown()
+                service.server_close()
             if not receiver.handshakes or not receiver.messages:
                 receiver.gap("required gVisor telemetry was not established")
             versions = Path("/opt/traceward/versions.json")

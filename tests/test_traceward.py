@@ -65,7 +65,9 @@ class TracewardTests(unittest.TestCase):
                  record(34, pid=200, start=999999, time=103.1, fd=3, fd_path='/workspace/synthetic-auth-config.json', exit=done(3))]
         engine, alerts, _ = self.exercise(hidden=False, extra=extra)
         self.assertIsNone(engine._tool_for('fixture:200:999999'))
-        self.assertFalse(alerts)
+        self.assertEqual(engine.summary()['finding_count'], 1)
+        self.assertIsNone(alerts[-1]['tool_use_id'])
+        self.assertEqual(alerts[-1]['attribution'], 'uncertain')
 
     def test_ambiguous_hook_attribution_is_withdrawn(self):
         extra = [record(3, pid=202, time=100.25, binary_path='/bin/sh', command_candidates=['npm test'])]
@@ -82,7 +84,10 @@ class TracewardTests(unittest.TestCase):
             with patch.dict(os.environ, {'XDG_STATE_HOME': str(root/'state')}):
                 self.assertEqual(replay(['--goal','Fix tests','--hooks',str(hooks),'--trace',str(trace),'--offline']),0)
             summary = next((root/'state/traceward/runs').glob('*/summary.json'))
-            self.assertEqual(json.loads(summary.read_text())['finding_count'],1)
+            self.assertEqual(json.loads(summary.read_text())['finding_count'],0)
+            self.assertEqual(json.loads(summary.read_text())['assessment_count'],2)
+            findings = [json.loads(line) for line in (summary.parent/'assessments.jsonl').read_text().splitlines()]
+            self.assertEqual({f.get('candidate_kind') for f in findings}, {'sensitive_access','network_effect'})
 
     def test_hook_redacts_and_never_persists_response(self):
         item = compact_hook({"hook_event_name": "PreToolUse", "tool_input": {

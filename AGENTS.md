@@ -1,6 +1,6 @@
 # TraceWard project context
 
-This is the implementation workspace for **TraceWard** (`traceward.ai`). On 2026-10-01 The project owner explicitly requested implementation of the Linux Codex PoC. The Python package, CLI, tests, and synthetic fixture are now in this directory. Inspect current code and tests before assuming any feature is complete; read `README.md` for setup, use, and measured limitations.
+This is the implementation workspace for **TraceWard** (`traceward.ai`). On 2026-10-01 the project owner explicitly requested implementation of the Linux Codex PoC. The Python package, CLI, tests, and synthetic fixture are now in this directory. Inspect current code and tests before assuming any feature is complete; read `README.md` for setup, use, and measured limitations.
 
 ## Current product direction
 

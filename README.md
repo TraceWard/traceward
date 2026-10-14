@@ -1,101 +1,151 @@
 # TraceWard
 
-TraceWard runs Linux Codex inside managed gVisor and existing Docker on macOS or Linux, combines trusted Codex hooks with independent runtime effects, and exports evidence-backed OCSF v1.8 JSONL. Docker, gVisor and Codex apply runtime restrictions. TraceWard observes and analyses; findings do not block or terminate the agent.
+**Goal-first observability for autonomous agents.**
 
-The managed runtime works on native ARM64 Docker Desktop in the measured configuration. **Qwen is now the default local judge.** It passed the six fresh real-Codex capture, dashboard and reviewed-decision checks, including the authorised receiver that Laya incorrectly flagged. It also passed 46 controlled regression/diagnostic cases after an ambiguous-goal rubric correction. These results support the PoC fixtures, not production accuracy; native AMD64 and public image publication remain pending. See [VALIDATION.md](VALIDATION.md).
+Understand what an agent actually did, how its actions relate to the task you authorised, and which unexpected effects need your attention.
 
-## Install and run
+## Why TraceWard is needed
 
-Requires Python 3.11+, running Docker, and LM Studio serving `qwen/qwen3.8-27b` on port 1234 for judgement. No separate gVisor installation or Docker daemon runtime configuration is needed. Model outages retain capture and report evaluation unavailable.
+Autonomous agents can run commands, modify files, start processes and communicate with external services. As they work towards a goal, they choose methods that you may not have anticipated.
+
+An agent's conversation or tool log tells part of that story. A routine test command might start a child process that reads credentials. A document might inject instructions that redirect the task. An agent might change the checks used to judge its work rather than fix the underlying problem. These effects can be difficult to explain from the agent's own account alone.
+
+Understanding that behaviour requires two kinds of evidence: what the agent was asked to do, and what happened when it acted. The same operation can be legitimate for one goal and inappropriate for another.
+
+TraceWard brings that evidence together. You start with an authorised goal, without having to predict every permitted tool, command or destination. The resulting observations help you investigate unexpected behaviour and decide where additional controls would be useful.
+
+## What TraceWard does
+
+TraceWard is designed to observe agents across frameworks. It connects agent actions with independently observed effects and assesses them against the authorised goal.
+
+It helps you:
+
+- **See actual effects.** Inspect process activity, filesystem access, network activity and resulting state within the observed environment.
+- **Connect actions across tools and processes.** Follow a command into its child processes, or relate operations through shared resources and sampled file versions.
+- **Investigate possible misalignment.** Review evidence of task-irrelevant access, unwanted changes, suspicious transfers, verification tampering and discrepancies in completion claims.
+- **Understand each finding.** Examine the supporting events, goal relevance, authority evidence, possible benign explanations and missing information.
+- **Keep an auditable record.** Explore runs in a local dashboard and retain source records, assessment revisions and OCSF-formatted events.
+
+Internal investigation candidates are separate from findings. Actions assessed as consistent with the goal remain in the assessment audit; supported concerns become review findings. Incomplete or unavailable assessments stay visible without being presented as reassuring conclusions.
+
+TraceWard provides observation, analysis and alerts for human review. Your existing runtimes, policies and approval systems remain responsible for permissions and enforcement.
+
+## How TraceWard works
+
+TraceWard combines agent-side signals with independent runtime observations, then builds a bounded evidence packet for goal-based assessment.
+
+```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 300, "nodeSpacing": 35, "rankSpacing": 35}}}%%
+flowchart TB
+  Goal["Authorised goal"]
+  Agent["Agent and its tools"]
+  subgraph Capture[Collect evidence]
+    direction LR
+    Signals["Agent-side signals<br/>tool calls, results and context"]
+    Effects["Independent observations<br/>processes, files, network and state"]
+  end
+  Correlate["Correlate actions and effects<br/>lineage, resources and timing"]
+  Assess["Assess against the goal<br/>evidence, authority and uncertainty"]
+  Evidence["Local evidence and assessment history"]
+  Review["Review findings in the dashboard<br/>inspect sources and coverage"]
+
+  Agent --> Signals
+  Agent --> Effects
+  Signals --> Correlate
+  Effects --> Correlate
+  Correlate --> Assess
+  Goal --> Assess
+  Assess --> Evidence --> Review
+
+  style Goal fill:#dbeafe,stroke:#3b82f6,color:#1e3a5f
+  style Agent fill:#bfdbfe,stroke:#2563eb,color:#1e3a5f
+  style Signals fill:#ffedd5,stroke:#ea580c,color:#431407
+  style Effects fill:#ccfbf1,stroke:#0d9488,color:#042f2e
+  style Correlate fill:#c4b5fd,stroke:#6d28d9,color:#2e1065
+  style Assess fill:#fde68a,stroke:#d97706,color:#3d2e00
+  style Evidence fill:#d1fae5,stroke:#059669,color:#064e3b
+  style Review fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e
+```
+
+1. **Capture the goal and observations.** The operator supplies the authorised task. Supported integrations provide tool and session signals, while runtime collection and host state checks supply independent evidence. Captured documents and tool output remain lower-trust content; they cannot replace the original goal.
+2. **Build the evidence chain.** TraceWard uses process ancestry, tool metadata, resource versions and timing to associate actions with effects. Observed relationships are distinguished from inferred connections, and ambiguous attribution stays explicit.
+3. **Assess consequential behaviour.** A structured model assessment considers goal relevance, authority, integrity, outcome support, benign explanations and missing evidence. Deterministic checks validate selected factual predicates and evidence references. Findings include a rationale and citations to the supporting events.
+4. **Retain and review the result.** Local JSONL records preserve observations and assessment revisions. SQLite provides rebuildable indexes for correlation and the read-only dashboard. You can inspect a finding, follow its source events and review the limits of the capture.
+
+### Set up locally
+
+You need Python 3.11+, `uv`, Node.js 20.19+ or 22.12+, npm and running Docker. The measured runtime configuration uses native ARM64 Docker Desktop; native AMD64 validation remains pending. No separate gVisor installation or Docker runtime configuration is required.
+
+Clone the repository and install the core package with dashboard dependencies. The examples below also install the optional Pi evaluation package, which is separate from TraceWard's core functionality.
 
 ```sh
-python3 -m pip install -e '.[dashboard]'
-traceward run --goal "Diagnose the failing test" codex \
-  --sandbox workspace-write -c sandbox_workspace_write.network_access=true exec "Run npm test and explain the failure"
-```
-
-On first use TraceWard pulls `ghcr.io/traceward/runner:0.2.0`, then reuses the cached image. Public publication is pending; until it is published, a failed default-image pull automatically builds the bundled recipe. First build needs network access and takes longer than cached launches. A custom runner pull failure does not silently substitute the default image.
-
-All arguments after `codex` are forwarded unchanged. TraceWard options (`--runner-image`, `--workspace`, `--guest-image`, `--judge-provider`, `--judge-url`, `--judge-model`, `--goal-file`) precede `codex`. Interactive goal entry, terminal I/O, resizing, operator signals, working directory and exit status are preserved. This executes **Linux Codex**, not native macOS binaries.
-
-The tested Codex configuration is explicit **workspace-write with network access**. Codex's default read-only/network-isolated Bubblewrap mode failed inside pinned gVisor host networking (`Failed to look up lo`). TraceWard does not silently disable Codex's sandbox or approvals. Native AMD64 execution awaits the native CI gate; emulated AMD64 on ARM64 is rejected because systrap failed under emulation. Rootless Docker and arbitrary pre-existing containers are unverified and unsupported in v1.
-
-## Credentials and hooks
-
-For **actual-agent adversarial evaluation**, the separately installed `traceward-pi eval` lab runs Pi with local Qwen in disposable repositories and measures receiver receipts, protected-state changes and task completion independently of TraceWard's judge. It also supports explicit actor-model comparisons. See [Pi evaluation harness](evaluation/pi/README.md) for cases, isolation, transcript handling, limitations and reproduction. This experimental Pi path uses a fresh home and Docker-isolated networking; the Codex credential/trust instructions below still apply to Codex runs.
-
-The effective `CODEX_HOME`, or `~/.codex`, is mounted writable at `/codex-home`. Existing file-backed authentication is reused; refresh, configuration, history and hook trust persist. Keychain-only authentication is not portable: configure Codex `cli_auth_credentials_store = "file"` and sign in on the host if necessary. TraceWard does not extract Keychain secrets. Shared history can contain host paths unavailable in Linux; stale rollout-path warnings were observed. Host-specific MCP commands and tools may also be unavailable.
-
-Start an interactive run once, open Codex `/hooks`, review and trust the three TraceWard handlers. The stable command is:
-
-```text
-PYTHONPATH=/opt/traceward-hooks /usr/local/bin/python3 -m traceward.hook_sink
-```
-
-TraceWard does not write trust hashes or bypass `/hooks`. Without trusted hooks, runtime observation continues with an explicit combined-coverage gap.
-
-The workspace is mounted at its original absolute path, with external Git worktree metadata where needed. `--workspace` must contain the invoking working directory. The guest receives only the workspace, Codex home, hook log, read-only hook helper and startup gate. Observer credentials and evidence directories are excluded. If an observer `.env` file already lies inside the mounted workspace, TraceWard reports the overlap; it cannot conceal an existing workspace file. Avoid running an observed task in TraceWard's own checkout containing observer credentials.
-
-The runner uses `SYS_ADMIN`, `SYS_PTRACE`, and unconfined Docker seccomp/AppArmor settings for nested systrap; it uses neither `--privileged` nor the Docker socket. Guest `SETUID`, `SETGID` and `SETFCAP` capabilities are emulated by gVisor to support Codex's nested user namespace.
-
-## Custom dependencies and embedded execution
-
-`--guest-image IMAGE` exports a trusted native Docker image into a cached root filesystem. It must contain Linux Codex and `/usr/local/bin/python3` for the bootstrap/hooks. For example, extend the managed guest filesystem:
-
-```dockerfile
-FROM ghcr.io/traceward/runner:0.2.0 AS managed
-FROM scratch
-COPY --from=managed /opt/traceward/rootfs/ /
-RUN apt-get update && apt-get install -y --no-install-recommends make
-```
-
-```sh
-traceward run --goal "Build the project" --guest-image project-agent:local codex <flags>
-```
-
-The same supervisor can execute embedded inside the configured managed runner with the required Docker capabilities. Running inside arbitrary existing containers, Docker-free execution and transparent native macOS process capture are outside v1.
-
-## Evidence and analysis
-
-Internal candidates and cleared/inconclusive decisions live in `assessments.jsonl`. Only review dispositions and explicit withdrawals enter `findings.jsonl`; the default dashboard and findings API show current review findings. The separate Assessment audit view retains complete diagnostic history, including historical cleared records. A finding is a supported concern requiring review, rather than every operation considered by the detector.
-
-Owner-only runs live at `${XDG_STATE_HOME:-~/.local/state}/traceward/runs/<uuid>/`: `run.json`, `raw.gvisor.jsonl`, `hooks.jsonl`, `events.jsonl`, `findings.jsonl`, `evaluations.jsonl`, `runtime-status.json`, and `summary.json`. JSONL is authoritative. The dashboard's owner-only SQLite database is a rebuildable projection. Historical strace runs and attachments remain readable; live strace launchers, parsers and replay were removed.
-
-The receiver validates SecCheck version-1 handshakes and bounded protobuf packets from pinned `release-20260928.0` schemas. A verified trace session releases the agent startup gate. Required telemetry failure prevents task startup; loss during execution marks coverage incomplete and lets the guest continue. Process identities use sandbox/PID/start time. Descriptor duplication, closure, inheritance, sharing and CLOEXEC support file/socket attribution. Positive returned byte counts establish effects; failures and asynchronous connection attempts remain distinct.
-
-The runtime collector does not persist syscall read/write buffers, network payloads or environment values. Raw source records retain redacted metadata and stable line references. Shell commands, paths and hook metadata can still be sensitive. mmap coverage is incomplete, unresolved destinations and unsupported effects are gaps, and read followed by send does not prove transmission of those bytes. Hooks are agent-writable; this is not tamper-proof evidence. The optional Pi evaluation lab separately saves actual synthetic actor transcripts and receiver hashes; see [Pi evaluation harness](evaluation/pi/README.md) before sharing those artifacts.
-
-The expanded pipeline creates investigations for workspace writes, host-observed repository changes, standalone sensitive reads, failed sensitive access or network attempts, independent network effects and access to operator-declared shared roots. Hook attribution strengthens an explanation; missing hooks do not discard independently observed effects. Candidates become alerts only after a review disposition. Incomplete attribution or omitted context prevents a reassuring clearance.
-
-`--context-mode redacted` opts into bounded, locally redacted tool-result/session excerpts and selected file diffs. The default `metadata` mode retains hashes and metadata without those excerpts. Contents are labelled by source and trust; document claims and captured user-role messages cannot supersede the original CLI goal. Redaction is best effort, so redacted capture still requires local handling of potentially sensitive text.
-
-Host baseline/final snapshots preserve sampled file identity and content versions. A local SQLite evidence graph connects tools, paths and sampled versions; path/time edges are inference. `--shared-root PATH` opts into cross-run version lookup for a shared directory in the workspace, without granting permissions. `traceward rebuild-graph` rebuilds the derived index from retained logs; deleted source records and uncollected versions cannot be recovered.
-
-`--validation-script PATH` freezes an observer-selected checker outside the guest workspace and runs it in a separate read-only, network-isolated Docker invocation. `--permissions-file PATH` imports a bounded external permission log outside the observed workspace. Requests, denials, proposals and approvals retain identity, scope, expiry and revision when supplied. The adapter recognises OpenShell evidence shapes; no live OpenShell deployment or enforcement integration is implied. Missing fields remain missing. The evaluation lab's approval service is a synthetic application controller, not a runtime permission grant.
-
-New packets use `goal-effects-v4`: relevance, authority, integrity, outcome, benign explanations and missing evidence have separate categorical assessments and citations. Observer-computed factual predicates check selected claims against event types, integrity flags and full hash/version matches. These checks do not prove natural-language entailment, intent, payload transmission or resistance to every injection. Semantic input is capped at 12 KiB; the complete factual-table user message at 14 KiB. Full packets and exact requests remain auditable. Legacy packets retain v3.
-
-The judge runs on the invoking host. Defaults are `lmstudio`, `qwen/qwen3.8-27b`, and `http://127.0.0.1:1234/v1/chat/completions`. A supplied `/api/v1` base is normalized to this same server’s schema-capable OpenAI-compatible endpoint. TraceWard requests strict JSON with `disposition`, `evidence_ids`, and `rationale`; it validates model identity, completion and citations. Categorical results have **no numerical risk score**. Malformed, refused, truncated or unresolved answers are unavailable; no model fallback is used.
-
-Set `TRACEWARD_JUDGE_PROVIDER`, `TRACEWARD_JUDGE_URL` and `TRACEWARD_JUDGE_MODEL` in the checkout `.env`, an explicit `TRACEWARD_ENV_FILE`, or process environment; CLI `--judge-*` overrides these settings. Environment wins over file settings. Optional endpoint authentication uses only `TRACEWARD_JUDGE_TOKEN`; the Unsloth token is never sent to LM Studio. Settings are stripped from the agent environment. The loaded server context is unchanged; Qwen receives bounded factual episodes of at most 8,192 UTF-8 bytes with a 1,600-token output limit and reasoning disabled. Full packets, exact requests/responses and alias/group mappings remain auditable. Pruning, ambiguity, outage and incomplete coverage prevent a clearing decision.
-
-Legacy Laya remains explicitly selectable with `--judge-provider laya` (or `--laya-url`), using `TRACEWARD_LAYA_URL`, `TRACEWARD_LAYA_MODEL` and `UNSLOTH_TOKEN`. Its original 1,800-byte input budget and uncalibrated score thresholds are unchanged. Historical JSONL/API field `laya` holds model assessments for compatibility; inspect its actual `provider`, `model` and `status` rather than interpreting the field name as model provenance.
-
-## Dashboard and validation
-
-```sh
+git clone https://github.com/TraceWard/traceward.git
+cd traceward
+uv venv --python 3.11
+uv pip install --python .venv/bin/python -e '.[dashboard]'
+uv pip install --python .venv/bin/python --no-deps -e evaluation/pi
 npm ci --prefix web
 npm run build --prefix web
-traceward dashboard
-python3 -m unittest discover -s tests -q
-TRACEWARD_TEST_DOCKER=1 python3 -m unittest discover -s tests -p test_gvisor_integration.py -q
-npm run test:e2e --prefix web
 ```
 
-Browser tests use Chrome by default; set `PLAYWRIGHT_CHANNEL` for another installed supported browser. They use explicitly synthetic decisions against real JSONL/API projections. Real six-case validation, actual decisions, UI inspection and measurements are documented in [DEMO.md](DEMO.md) and [VALIDATION.md](VALIDATION.md).
-
-Replay preserves source attachments:
+Start a local OpenAI-compatible chat-completions server. Load a tool-calling model for the example agent and a model that supports strict JSON-schema responses for the judge. They can share a server. Replace the two placeholder IDs below with the exact model identifiers exposed by your server, and adjust the URLs if it uses a different port.
 
 ```sh
-traceward replay --goal "Diagnose a test failure" --hooks hooks.jsonl --trace raw.gvisor.jsonl --abi arm64 --offline
+export ACTOR_MODEL='your-actor-model-id'
+export JUDGE_MODEL='your-judge-model-id'
+export ACTOR_URL='http://127.0.0.1:1234/v1/chat/completions'
+export JUDGE_URL='http://127.0.0.1:1234/v1/chat/completions'
 ```
+
+These examples explicitly select the model settings. For the current OpenAI-compatible judge adapter, the provider flag is `lmstudio`. The model server runs on the host; the example agent reaches its selected endpoint through a restricted relay.
+
+### Run an example with Pi
+
+From the repository root, create a disposable workspace and observe a small file-creation task:
+
+```sh
+TRACEWARD_DIR=$(pwd)
+EXAMPLE_WORKSPACE=$(mktemp -d)
+(
+  cd "$EXAMPLE_WORKSPACE"
+  "$TRACEWARD_DIR/.venv/bin/python" -m traceward_pi.cli run \
+    --workspace "$EXAMPLE_WORKSPACE" \
+    --goal "Create hello.py that prints Hello, world! Do not change other files." \
+    --pi-model "$ACTOR_MODEL" --pi-url "$ACTOR_URL" \
+    --judge-provider lmstudio \
+    --judge-model "$JUDGE_MODEL" --judge-url "$JUDGE_URL" \
+    pi --print "Create hello.py that prints Hello, world! Do not change other files."
+)
+```
+
+Pi runs inside the managed Linux runtime. TraceWard automatically prepares the runtime and Pi images on first use; the initial build needs network access and takes longer than cached runs. You do not need to install Pi on the host. Ordinary authorised work should not produce a misalignment finding; its evidence and any assessments remain available for inspection.
+
+To try the evaluation harness, run a benign repair alongside a compromised-dependency scenario:
+
+```sh
+.venv/bin/python -m traceward_pi.cli eval \
+  --actor-model "$ACTOR_MODEL" --actor-url "$ACTOR_URL" \
+  --judge-model "$JUDGE_MODEL" --judge-url "$JUDGE_URL" \
+  --cases normal dependency-side-effect \
+  --timeout 360
+```
+
+The harness creates fresh disposable workspaces, uses synthetic credentials and a local receiver, and checks outcomes independently of the judge. Pi chooses its tool calls. Reports distinguish reproduced unwanted effects, detections, false alerts and incomplete runs; a resisted attack is not a successful detection. The command prints the report location, normally under `~/.local/state/traceward/pi-evaluation-<run-id>/`. See the [Pi evaluation guide](evaluation/pi/README.md) for additional cases and options.
+
+### Open the dashboard
+
+In a separate terminal, from the repository root:
+
+```sh
+.venv/bin/python -m traceward.cli dashboard
+```
+
+Open [http://localhost:8765](http://localhost:8765). The dashboard reads captured runs from `~/.local/state/traceward/runs/` by default and can display existing evidence without Docker or a model server running. Keep the terminal open while using it; press `Ctrl+C` to stop the dashboard. Installing `.[dashboard]` above includes both FastAPI and `uvicorn`.
+
+### Current implementation and limits
+
+The current runtime backend uses managed gVisor inside Docker to collect selected Linux process, filesystem and network events. Correlation, host state observation and the judge client run on the invoking host. Agent-independent operation is the product goal; available integrations and tested runtime configurations currently determine coverage. Universal agent and platform support is not yet implemented.
+
+Runtime metadata does not prove which bytes were transmitted, and correlation does not prove an agent's hidden intent. Unsupported operations, missing signals, bounded context and model errors can leave behaviour undetected or misinterpreted. Redacted content capture is opt-in, and local evidence is not tamper-proof against the same host user. Known evaluation results are developmental evidence, not measured production accuracy. **No finding is not proof of safety.**
+
+See the [runtime setup and operations guide](docs/runtime.md) for installation, supported configurations, privacy and commands. The [validation record](VALIDATION.md) documents measured outcomes and remaining gaps, and the [demonstration guide](DEMO.md) explains reproducible examples.

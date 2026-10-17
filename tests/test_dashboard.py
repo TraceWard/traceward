@@ -107,6 +107,31 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/runs", headers={"Host": "attacker.example"}).status_code, 403)
         self.assertEqual(self.client.get("/api/runs", headers={"Origin": "https://attacker.example"}).status_code, 403)
 
+    def test_cross_run_findings_use_latest_revision_per_run_and_exclude_audit(self):
+        from traceward.ocsf import EvidenceStore
+        other_id = str(uuid.uuid4())
+        other = self.runs / other_id
+        other.mkdir()
+        (other / 'run.json').write_text(json.dumps({'name': 'Dependency audit', 'source': 'pi'}))
+        base = {'finding_id': 'shared-id', 'revision': 1, 'time': 100,
+                'title': 'Review dependency', 'message': 'Synthetic review',
+                'status': 'review_required', 'evidence_ids': ['event']}
+        first = EvidenceStore(self.run_dir, self.run_id)
+        second = EvidenceStore(other, other_id)
+        first.assessment(base)
+        second.assessment({**base, 'time': 102})
+        first.assessment({**base, 'revision': 2, 'time': 103, 'status': 'consistent_with_goal'})
+        second.assessment({**base, 'finding_id': 'pending', 'status': 'inconclusive'})
+        response = self.client.get('/api/findings')
+        self.assertEqual(response.status_code, 200)
+        findings = response.json()['findings']
+        self.assertEqual([(f['run_id'], f['finding_id'], f['revision']) for f in findings],
+                         [(other_id, 'shared-id', 1)])
+        self.assertEqual(findings[0]['evidence_ids'], ['event'])
+        self.assertEqual(self.client.get(f'/api/runs/{other_id}').json()['name'], 'Dependency audit')
+        second.assessment({**base, 'revision': 2, 'time': 104, 'status': 'withdrawn'})
+        self.assertEqual(self.client.get('/api/findings').json()['findings'], [])
+
     def test_gvisor_source_and_pid_reuse_preserve_distinct_evidence(self):
         first = self._event("first")
         second = self._event("second")

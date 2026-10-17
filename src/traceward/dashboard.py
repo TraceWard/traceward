@@ -213,7 +213,8 @@ class RunIndex:
             evaluation_label = "Model unavailable"
         else:
             evaluation_label = "Assessment pending"
-        return {"run_id": row["run_id"], "goal": manifest.get("goal") or (summary or {}).get("goal") or "Goal unavailable",
+        return {"run_id": row["run_id"], "name": manifest.get("name") or manifest.get("run_name"),
+                "goal": manifest.get("goal") or (summary or {}).get("goal") or "Goal unavailable",
                 "started_at": manifest.get("started_at") or row["updated_at"], "updated_at": row["updated_at"],
                 "status": status, "summary": summary, "event_counts": {r["kind"]: r["n"] for r in counts},
                 "finding_count": review_count, "assessment_count": len(assessments), "finding_title": finding_title,
@@ -274,6 +275,22 @@ class RunIndex:
 
     def findings(self, run_id: str) -> list[dict]:
         return [f for f in self.assessments(run_id) if f.get('status') == 'review_required']
+
+    def all_findings(self) -> list[dict]:
+        """Latest review findings across runs, excluding withdrawals and audit records."""
+        with self.lock:
+            rows = self.db.execute("""SELECT f.run_id,f.body FROM findings f JOIN
+              (SELECT run_id,finding_id,MAX(revision) revision FROM findings
+               GROUP BY run_id,finding_id) latest
+              ON f.run_id=latest.run_id AND f.finding_id=latest.finding_id
+                 AND f.revision=latest.revision
+              ORDER BY f.time_s DESC,f.run_id,f.finding_id""").fetchall()
+            results = []
+            for row in rows:
+                finding = json.loads(row['body'])
+                if finding.get('status') == 'review_required':
+                    results.append({**finding, 'run_id': row['run_id']})
+            return results
 
     def processes(self, run_id: str) -> list[dict]:
         with self.lock:
@@ -351,7 +368,7 @@ def create_app(index: RunIndex, assets: Path | None = None):
         response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'"
         return response
 
     def required_run(run_id: str) -> dict:
@@ -371,6 +388,11 @@ def create_app(index: RunIndex, assets: Path | None = None):
     def runs():
         index.refresh()
         return {"runs": index.runs(), "revision": index.revision}
+
+    @app.get("/api/findings")
+    def all_findings():
+        index.refresh()
+        return {"findings": index.all_findings(), "revision": index.revision}
 
     @app.get("/api/runs/{run_id}")
     def run(run_id: str):

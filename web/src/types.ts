@@ -1,0 +1,95 @@
+export type Summary = {
+  coverage_gaps?: string[];
+  codex_exit_code?: number;
+  interpretation?: string;
+  linked_tool_processes?: number;
+  first_alert_latency_seconds?: number;
+};
+export type Run = {
+  run_id: string;
+  name?: string | null;
+  goal: string;
+  started_at: number;
+  updated_at: number;
+  status: "live" | "complete" | "incomplete";
+  summary: Summary | null;
+  event_counts: Record<string, number>;
+  finding_count: number;
+  assessment_count?: number;
+  review_count?: number;
+  evaluation_label?: string;
+  source?: string;
+  demo_case?: string;
+  legacy?: boolean;
+  finding_title?: string | null;
+  ingest_errors: number;
+};
+export type Event = {
+  index_id?: number;
+  metadata: { uid: string };
+  class_uid: number;
+  activity_name: string;
+  time: number;
+  message?: string;
+  process?: {
+    pid: number;
+    name: string;
+    parent_process?: { pid: number };
+    cmd_line?: string;
+  };
+  actor?: { process?: { pid: number } };
+  file?: { path: string };
+  dst_endpoint?: { ip?: string; domain?: string; port?: number };
+  unmapped?: {
+    traceward?: {
+      source?: string;
+      event_id?: string;
+      pid?: number;
+      event_kind?: string;
+      process_key?: string;
+      parent_process_key?: string;
+      raw_trace_ref?: string;
+      hook_event?: string;
+      apparent_command?: string;
+      tool_use_id?: string;
+      endpoint?: string;
+      byte_count?: number;
+      operation_status?: string;
+      errno?: number;
+      result?: number;
+      exit_status?: number;
+      details?: Record<string, unknown>;
+    };
+  };
+};
+export type Finding = {
+  finding_id: string;
+  revision: number;
+  time: number;
+  title: string;
+  message: string;
+  status: string;
+  attribution: string;
+  tool_use_id?: string;
+  evidence_ids: string[];
+  observed_effects: string[];
+  counterevidence: string[];
+  coverage_gaps: string[];
+  uncalibrated_risk_score: number | null;
+  assessment_note?: string;
+  is_alert?: boolean;
+  assessment?: Record<string, {status: string; summary: string; evidence_ids: string[]}>;
+  verified_claims?: {fact_type: string; evidence_ids: string[]}[];
+  laya?: {
+    status: string;
+    reason?: string;
+    model?: string;
+    semantic_accuracy_validated?: boolean;
+    dimensions?: Record<string, number>;
+    disposition?: string;
+    rationale?: string;
+    cited_evidence_ids?: string[];
+  };
+  revisions: Finding[];
+};
+export type Raw = { source: string; lines: { line: number; text: string }[] };

@@ -85,6 +85,8 @@ Legacy Laya remains explicitly selectable with `--judge-provider laya` (or `--la
 
 ## Dashboard and validation
 
+The dashboard opens on **Agent Runs**, with search by name, goal or run ID and filters for harness, capture status and findings. Select a table row to open **Agent Run Investigation**. The authorised goal and run metrics remain at the top, with **Findings** first and selected by default, followed by **Evidence Stream**, beneath the overview. The active tab can be refreshed/bookmarked; panel content expands and the page scrolls. The evidence timeline defaults to newest first, with an oldest-first option. Event details stay alongside the timeline while scrolling on wide screens; on narrow screens, selection jumps to the details. **Back to selected event** returns to the selected row without adding an inner scroll area. Within findings and the assessment audit, descriptive evidence links expand event details directly beneath the citations; the finding and page position remain in place, and closing details restores focus to the citation. **Findings** is a separate view of current review findings across runs, with links into their evidence. Cleared and incomplete records remain in the per-run **Assessment audit**. List filters persist while navigating and reset on reload; direct investigation URLs can be refreshed or bookmarked. Filtering and pagination currently happen in the browser after loading the local summaries and current findings.
+
 ```sh
 npm ci --prefix web
 npm run build --prefix web

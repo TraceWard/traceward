@@ -18,6 +18,7 @@ from .privacy import redact
 from .gvisor import GvisorParser
 from .runtime import ManagedRuntime
 from .instructions import codex_instruction
+from .records import assessment_record
 
 
 def state_root() -> Path:
@@ -27,7 +28,7 @@ def state_root() -> Path:
 
 def _usage() -> str:
     return (
-        "usage: traceward run [--goal TEXT | --goal-file PATH] [--context-mode metadata|redacted] [--validation-script PATH] [--permissions-file PATH] [--shared-root PATH] [--judge-provider lmstudio|laya] [--judge-url URL] [--judge-model MODEL] [--runner-image IMAGE] [--workspace PATH] [--guest-image IMAGE] [--defer-judge] codex [AGENT FLAGS...] [INITIAL INSTRUCTION]\n"
+        "usage: traceward run [--goal TEXT | --goal-file PATH] [--context-mode metadata|redacted] [--validation-script PATH] [--permissions-file PATH] [--shared-root PATH] [--judge-provider lmstudio] [--judge-url URL] [--judge-model MODEL] [--runner-image IMAGE] [--workspace PATH] [--guest-image IMAGE] [--defer-judge] codex [AGENT FLAGS...] [INITIAL INSTRUCTION]\n"
         "       traceward eval pi [--cases CASE...] [--trials N] [--actor-model MODEL] [--actor-url URL]\n"
         "       traceward watch RUN_ID\n"
         "       traceward dashboard [--runs-dir PATH] [--port PORT]\n"
@@ -37,7 +38,7 @@ def _usage() -> str:
 
 
 def _parse_run(args: list[str], *, instruction_parser=codex_instruction) -> tuple:
-    goal = goal_file = laya_url = image = workspace = guest_image = None
+    goal = goal_file = image = workspace = guest_image = None
     judge_options = {}
     agent_options = {}
     index = 0
@@ -47,15 +48,13 @@ def _parse_run(args: list[str], *, instruction_parser=codex_instruction) -> tupl
             agent_options['defer_evaluation'] = True
             index += 1
             continue
-        if flag not in {"--goal", "--goal-file", "--laya-url", "--runner-image", "--workspace", "--guest-image", "--judge-provider", "--judge-url", "--judge-model", '--context-mode', '--validation-script', '--permissions-file', '--shared-root'} or index + 1 >= len(args):
+        if flag not in {"--goal", "--goal-file", "--runner-image", "--workspace", "--guest-image", "--judge-provider", "--judge-url", "--judge-model", '--context-mode', '--validation-script', '--permissions-file', '--shared-root'} or index + 1 >= len(args):
             raise ValueError(_usage())
         value = args[index + 1]
         if flag == '--goal':
             goal = value
         elif flag == '--goal-file':
             goal_file = value
-        elif flag == "--laya-url":
-            laya_url = value
         elif flag == "--runner-image":
             image = value
         elif flag == "--workspace":
@@ -74,10 +73,8 @@ def _parse_run(args: list[str], *, instruction_parser=codex_instruction) -> tupl
     agent_options['agent'] = args[index]
     if agent_options.get('context_mode', 'metadata') not in {'metadata', 'redacted'}:
         raise ValueError('--context-mode must be metadata or redacted')
-    if laya_url and judge_options:
-        raise ValueError('choose --laya-url or --judge-* options')
-    if judge_options.get('provider', 'lmstudio') not in {'lmstudio', 'laya'}:
-        raise ValueError('judge provider must be lmstudio or laya')
+    if judge_options.get('provider', 'lmstudio') != 'lmstudio':
+        raise ValueError('judge provider must be lmstudio')
     if goal is not None and goal_file is not None:
         raise ValueError('choose --goal or --goal-file, not both')
     agent_args = args[index + 1:]
@@ -90,7 +87,7 @@ def _parse_run(args: list[str], *, instruction_parser=codex_instruction) -> tupl
         # Preserve stdin and all agent arguments, including interactive starts.
     else:
         goal, agent_args = instruction_parser(agent_args)
-    return goal, laya_url, agent_args, image, workspace, guest_image, judge_options, agent_options
+    return goal, agent_args, image, workspace, guest_image, judge_options, agent_options
 
 
 def _tail_lines(path: Path, offset: int, pending: str, *, limit: int = -1) -> tuple[list[str], int, str]:
@@ -136,7 +133,7 @@ def _write_manifest(path: Path, run_id: str, goal: str | None, started_at: float
 
 def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_name='codex',
         instruction_parser=codex_instruction) -> int:
-    goal, laya_url, codex_args, image, workspace, guest_image, judge_options, agent_options = _parse_run(
+    goal, codex_args, image, workspace, guest_image, judge_options, agent_options = _parse_run(
         args, instruction_parser=instruction_parser)
     defer_evaluation = agent_options.pop('defer_evaluation', False)
     pending_goal = goal is None
@@ -202,7 +199,7 @@ def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_na
                     graph_path=state_root().parent / 'evidence-graph.sqlite', shared_roots=shared_roots,
                     transport_endpoints=runtime.transport_endpoints,
                     agent_state_roots=runtime.agent_state_roots,
-                    judge_fn=lambda evidence: judge(evidence, laya_url=laya_url, **judge_options))
+                    judge_fn=lambda evidence: judge(evidence, **judge_options))
     for gap in runtime.gaps:
         engine.add_gap(gap)
     states = StateObserver(root, context_mode)
@@ -396,15 +393,15 @@ def watch(run_id: str) -> int:
         lines, offset, pending = _tail_lines(path, offset, pending)
         for line in lines:
             try:
-                item = json.loads(line)
+                item = assessment_record(json.loads(line))
             except ValueError:
                 continue
             print(f"{item['time']:.3f} r{item['revision']} {item['finding_id']} {item['title']}")
             print(f"  {item['message']}")
             if item.get("uncalibrated_risk_score") is not None:
                 print(f"  Model uncalibrated risk score: {item['uncalibrated_risk_score']}")
-            if item.get('laya', {}).get('rationale'):
-                print(f"  Model: {item['laya'].get('model')} — {item['laya']['rationale']}")
+            if item.get('judge', {}).get('rationale'):
+                print(f"  Model: {item['judge'].get('model')} — {item['judge']['rationale']}")
         if (run_dir / "summary.json").exists():
             return 0
         time.sleep(0.2)

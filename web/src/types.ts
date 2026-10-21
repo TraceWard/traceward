@@ -81,7 +81,7 @@ export type Finding = {
   analysis_window?: {duration_seconds: number; stride_seconds: number; agent_finished: boolean};
   assessment?: Record<string, {status: string; summary: string; evidence_ids: string[]}>;
   verified_claims?: {fact_type: string; evidence_ids: string[]}[];
-  laya?: {
+  judge?: {
     status: string;
     reason?: string;
     validation_error?: string;

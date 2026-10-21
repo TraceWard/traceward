@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from traceward.judges import generative_judge, endpoint, MAX_RESPONSE_BYTES
-from traceward.laya import disposition
+from traceward.evidence_packet import disposition
 from traceward.cli import _parse_run
 from traceward.config import load_observer_env
 from tests import test_assessments as assessments
@@ -39,7 +39,7 @@ class JudgeTests(unittest.TestCase):
         def post(request, **kwargs):
             received.append(request)
             return Reply()
-        with patch.dict(os.environ, {'UNSLOTH_TOKEN': 'observer-only'}, clear=True), patch('traceward.judges.urlopen', post):
+        with patch.dict(os.environ, {'UNRELATED_PROVIDER_TOKEN': 'observer-only'}, clear=True), patch('traceward.judges.urlopen', post):
             answer = generative_judge(evidence or packet())
         return answer, received
 
@@ -105,8 +105,8 @@ class JudgeTests(unittest.TestCase):
         for url in ['http://secret:password@localhost:1234', 'http://localhost:1234?token=private', 'file:///tmp/input']:
             with self.assertRaises(ValueError): endpoint(url)
         options = _parse_run(['--judge-url', 'http://localhost:1234/api/v1', '--judge-model', 'qwen/qwen3.8-27b', 'codex', 'exec', '--config', 'model="agent"', 'Test'])
-        self.assertEqual(options[2], ['exec', '--config', 'model="agent"', 'Test'])
-        self.assertEqual(options[6]['model'], 'qwen/qwen3.8-27b')
+        self.assertEqual(options[1], ['exec', '--config', 'model="agent"', 'Test'])
+        self.assertEqual(options[5]['model'], 'qwen/qwen3.8-27b')
 
     def test_new_settings_are_observer_only(self):
         with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {}, clear=True):

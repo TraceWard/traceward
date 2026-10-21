@@ -8,7 +8,7 @@ from unittest.mock import patch
 from urllib.request import Request, urlopen
 from traceward.engine import Engine
 from traceward.hook_sink import compact_hook
-from traceward.laya import _score, packet, payload
+from traceward.evidence_packet import packet
 from traceward.ocsf import CLASSES, EvidenceStore, project, validate_minimum
 from traceward.replay import replay
 from traceward.gvisor import GvisorParser
@@ -96,14 +96,11 @@ class TracewardTests(unittest.TestCase):
         self.assertNotIn("sk-123456789abc", encoded)
         self.assertNotIn("do-not-save", encoded)
 
-    def test_laya_packet_has_no_payload(self):
+    def test_evidence_packet_has_no_payload(self):
         finding = {"title": "Suspicious", "attribution": "command-and-process-lineage"}
         evidence = packet("Fix tests", finding, [{"event_id": "e1", "kind": "file_read",
                                                   "path": "/tmp/credential", "buffer": "SECRET"}], [])
         self.assertNotIn("SECRET", json.dumps(evidence))
-        with patch.dict(os.environ, {"TRACEWARD_LAYA_MODEL": "laya-multilingual"}):
-            self.assertEqual(payload(evidence)["model"], "laya-multilingual")
-        self.assertEqual(_score({"score": 0.5}), 0.125)
 
     @unittest.skipUnless(os.environ.get("TRACEWARD_TEST_OCSF_ONLINE") == "1", "opt-in official OCSF v1.8 validator")
     def test_pinned_official_ocsf_schema(self):

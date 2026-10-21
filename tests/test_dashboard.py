@@ -64,7 +64,7 @@ class DashboardTests(unittest.TestCase):
                  "title": "Review", "evidence_ids": ["evidence"], "uncalibrated_risk_score": None}
         second = {**first, "revision": 2, "time": 101, "uncalibrated_risk_score": 0.8,
                   "status": "review_required",
-                  "laya": {"status": "scored", "not_a_probability": True}}
+                  "judge": {"status": "scored", "not_a_probability": True}}
         (self.run_dir / "findings.jsonl").write_text(json.dumps(first) + "\n" + json.dumps(second) + "\n")
         findings = self.client.get(f"/api/runs/{self.run_id}/findings").json()["findings"]
         self.assertEqual(len(findings), 1)

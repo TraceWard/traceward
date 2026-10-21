@@ -1,5 +1,9 @@
 # Current developmental checkpoint
 
+## Structured judge cleanup — 2026-10-21
+
+The retired model adapter, its endpoint/token settings and its comparison variants have been removed from maintained interfaces. Shared evidence code now lives in `evidence_packet.py`, and new records use `judge`. Historical provider names, commands, numerical results and source reports below are retained as dated validation provenance; they do not describe current selectable providers. This cleanup is not a new accuracy measurement, and past failures are not relabelled as successes.
+
 ## Expanded six-area implementation and developmental comparison — 2026-10-12
 
 Initial bounded implementations now cover standalone/failed/unhooked candidates, opt-in redacted context, a rebuildable cross-tool/sample-version graph, external permission sequences, host state/frozen checking and goal-effects-v4 facets with deterministic factual predicates. The original Qwen judge and LM Studio uncensored actor remain. TraceWard remains observe-only.

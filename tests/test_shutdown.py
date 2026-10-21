@@ -99,7 +99,7 @@ class AssessmentShutdownTests(unittest.TestCase):
                 self.assertEqual(sum(a['status'] == 'review_required' for a in latest.values()), 1)
                 self.assertEqual(sum(a['status'] == 'evaluation_unavailable' for a in latest.values()), 2)
                 retained = next(a for a in latest.values() if a['status'] == 'review_required')
-                self.assertEqual(retained['laya']['reason'], 'assessment_cancelled_on_shutdown')
+                self.assertEqual(retained['judge']['reason'], 'assessment_cancelled_on_shutdown')
                 self.assertEqual(engine.summary()['finding_count'], 1)
                 before = {p.name: p.read_bytes() for p in root.glob('*.jsonl')}
                 request_count = len(calls)
@@ -215,7 +215,7 @@ class WrapperSignalTests(unittest.TestCase):
                     latest = json.loads((summary_path.parent/'assessments.jsonl').read_text().splitlines()[-1])
                     self.assertEqual(latest['status'], 'review_required' if second_signal is None else 'evaluation_unavailable')
                     if second_signal is not None:
-                        self.assertEqual(latest['laya']['reason'], 'assessment_cancelled_on_shutdown')
+                        self.assertEqual(latest['judge']['reason'], 'assessment_cancelled_on_shutdown')
                         self.assertIn('final review incomplete', ' '.join(summary['coverage_gaps']))
                         if backlog:
                             self.assertIn('observation processing interrupted', ' '.join(summary['coverage_gaps']))

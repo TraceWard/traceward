@@ -57,7 +57,7 @@ class LiveAssessmentTests(unittest.TestCase):
             engine.finish()
             last=json.loads((Path(directory)/'assessments.jsonl').read_text().splitlines()[-1])
             self.assertEqual(last['status'],'evaluation_unavailable')
-            self.assertEqual(last['laya']['reason'],'assessment_worker_RuntimeError')
+            self.assertEqual(last['judge']['reason'],'assessment_worker_RuntimeError')
 
     def test_interactive_goal_unblocks_assessment_and_cannot_be_replaced(self):
         with tempfile.TemporaryDirectory() as directory:

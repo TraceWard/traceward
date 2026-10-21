@@ -18,6 +18,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from traceward.records import assessment_record
 
 from traceward.cli import state_root
 from .transport import PI_IMAGE, PI_MODEL, PI_VERSION, private_json
@@ -186,7 +187,7 @@ def assess(spec: dict, workspace: Path, run_dir: Path, *, timed_out: bool = Fals
                   *['protected_file_changed:' + name for name in changed]]
     latest = {}
     assessment_rows = rows(run_dir / 'assessments.jsonl') or rows(run_dir / 'findings.jsonl')
-    for finding in assessment_rows:
+    for finding in map(assessment_record, assessment_rows):
         latest[finding['finding_id']] = finding
     by_id = {event['metadata']['uid']: event for event in events}
     def relevant_event(event, violation):
@@ -259,9 +260,9 @@ def assess(spec: dict, workspace: Path, run_dir: Path, *, timed_out: bool = Fals
             'effect_findings': effect_findings,
             'effect_sensor_event_ids': sensor_ids, 'effect_candidate_ids': candidates,
             'effect_detection_stage': failure_stage,
-            'judge_results': [{'status': f.get('laya', {}).get('status'),
-                               'model': f.get('laya', {}).get('model'),
-                               'provider': f.get('laya', {}).get('provider')} for f in findings],
+            'judge_results': [{'status': f.get('judge', {}).get('status'),
+                               'model': f.get('judge', {}).get('model'),
+                               'provider': f.get('judge', {}).get('provider')} for f in findings],
             'unresolved_evidence_ids': [eid for f in findings for eid in f.get('evidence_ids', []) if eid not in by_id],
             'model_calls': len(audit), 'tool_calls': sum(h.get('event') == 'PreToolUse' for h in hooks),
             'counts': summary.get('counts', {}), 'wall_seconds': summary.get('wall_seconds'),
@@ -331,7 +332,7 @@ def main(argv=None) -> int:
               'seed': args.seed, 'max_calls': args.max_calls, 'results': [],
               'source_sha256': {**{'harness/'+p.name: digest(p) for p in Path(__file__).parent.iterdir() if p.suffix in {'.py','.mjs'}},
                   **{'core/'+name: digest(Path(traceward.__file__).parent / name) for name in
-                      ('cli.py','instructions.py','runtime.py','runner.py','engine.py','judges.py','structured.py','context.py','state.py','graph.py','laya.py')}},
+                      ('cli.py','instructions.py','runtime.py','runner.py','engine.py','judges.py','structured.py','context.py','state.py','graph.py','evidence_packet.py','records.py')}},
               'context_mode': args.context_mode,
               'actor_sampling': {'temperature': 0.6, 'seed': args.seed, 'reasoning_effort': 'none', 'max_tokens': 1600},
               'limitations': ['Development fixtures, not independent holdout or production accuracy.',

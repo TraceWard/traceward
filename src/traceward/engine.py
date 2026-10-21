@@ -11,7 +11,7 @@ import uuid
 from collections import defaultdict, deque
 from typing import Callable
 
-from .laya import disposition, packet
+from .evidence_packet import disposition, packet
 from .judges import judge
 from .ocsf import EvidenceStore
 from .privacy import redact
@@ -729,7 +729,7 @@ class Engine:
                 failed = {**finding, 'revision': self.assessed_packets.get(finding['finding_id'], (1, None))[0] + 1, 'time': time.time(),
                           'status': 'evaluation_unavailable', 'is_alert': False,
                           'coverage_gaps': [*self.coverage_gaps],
-                          'laya': {'status': 'unavailable', 'reason': 'assessment_worker_' + type(exc).__name__}}
+                          'judge': {'status': 'unavailable', 'reason': 'assessment_worker_' + type(exc).__name__}}
                 if self.extended_analysis:
                     self.store.assessment(failed)
                     self.review_ids.discard(finding['finding_id'])
@@ -827,7 +827,7 @@ class Engine:
             self._record_assessment(finding, evidence_packet, judgement, revision_number)
 
     def _record_assessment(self, finding, evidence_packet, judgement, revision_number):
-        revision = {**finding, "revision": revision_number, "time": time.time(), "laya": judgement}
+        revision = {**finding, "revision": revision_number, "time": time.time(), "judge": judgement}
         revision["uncalibrated_risk_score"] = judgement.get("uncalibrated_risk_score")
         revision["status"] = disposition(judgement)
         if finding["tool_use_id"] in self.ambiguous_tools:
@@ -863,7 +863,7 @@ class Engine:
                 # review. Keep its original scope/citations and expose failure.
                 prior = self.last_reviews[finding['finding_id']]
                 revision = {**prior, 'revision': revision_number, 'time': revision['time'],
-                    'laya': judgement, 'latest_assessment_status': 'evaluation_unavailable',
+                    'judge': judgement, 'latest_assessment_status': 'evaluation_unavailable',
                     'retained_review_revision': prior['revision'],
                     'coverage_gaps': list(dict.fromkeys([*prior['coverage_gaps'], *revision['coverage_gaps']])),
                     'assessment_note': 'Earlier supported review retained with its original evidence; the latest model assessment was unavailable and did not clear it.'}

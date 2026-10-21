@@ -730,17 +730,17 @@ export default function App() {
                             {finding.assessment_note && <p className="assessment-note">{finding.assessment_note}</p>}
                             {finding.analysis_window && <p className="window-status">Rolling {finding.analysis_window.duration_seconds}-second observation window with relevant earlier causal evidence. {finding.analysis_window.agent_finished ? 'Final session context.' : 'Assessed while the session was running; new evidence feeds later windows.'}</p>}
                             <div className="section-label">
-                              DECISION MODEL · {finding.laya?.status === "unavailable"
+                              DECISION MODEL · {finding.judge?.status === "unavailable"
                                 ? "UNAVAILABLE"
-                                : finding.laya?.model || "PENDING"}
+                                : finding.judge?.model || "PENDING"}
                             </div>
-                            {finding.laya?.status === "assessed" ? (
+                            {finding.judge?.status === "assessed" ? (
                               <div className="score-card structured-assessment">
                                 <div className="score-top">
-                                  <div><span>MODEL VERDICT</span><strong>{finding.laya.disposition?.replaceAll("_", " ")}</strong></div>
-                                  <span className="score-tag">{finding.laya.model?.includes("demo") ? "SIMULATED EVALUATOR" : finding.laya.contract_version === 'goal-effects-live-v1' ? 'STRUCTURED LIVE REVIEW' : "STRUCTURED MODEL REVIEW"}</span>
+                                  <div><span>MODEL VERDICT</span><strong>{finding.judge.disposition?.replaceAll("_", " ")}</strong></div>
+                                  <span className="score-tag">{finding.judge.model?.includes("demo") ? "SIMULATED EVALUATOR" : finding.judge.contract_version === 'goal-effects-live-v1' ? 'STRUCTURED LIVE REVIEW' : "STRUCTURED MODEL REVIEW"}</span>
                                 </div>
-                                <p className="judge-rationale">{finding.laya.rationale}</p>
+                                <p className="judge-rationale">{finding.judge.rationale}</p>
                                 {finding.assessment && <div className="assessment-facets">
                                   {Object.entries(finding.assessment).map(([name, facet]) => <section key={name} className="assessment-facet" data-status={facet.status}>
                                     <div><strong>{name.replaceAll('_', ' ')}</strong><span>{facet.status.replaceAll('_', ' ')}</span></div>
@@ -752,11 +752,11 @@ export default function App() {
                                   <ul>{finding.verified_claims.map((claim, i) => <li key={i}>{claim.fact_type.replaceAll('_', ' ')} · {claim.evidence_ids.map(id => short(id)).join(', ')}</li>)}</ul>
                                   <p>These checks validate typed evidence predicates; model interpretations can still be wrong.</p>
                                 </div> : null}
-                                <EvidenceCitations key={`${finding.finding_id}:${finding.revision}:judge`} ids={finding.laya.cited_evidence_ids || []} evidence={evidence} label="Judge" openRaw={openRaw} />
+                                <EvidenceCitations key={`${finding.finding_id}:${finding.revision}:judge`} ids={finding.judge.cited_evidence_ids || []} evidence={evidence} label="Judge" openRaw={openRaw} />
                                 <p>No numerical risk score. This verdict is not a confirmed violation or proof of safety.</p>
                                 <p>Experimental judgement: validation covers reviewed cases; production accuracy is not established.</p>
                               </div>
-                            ) : finding.laya?.status === "scored" ? (
+                            ) : finding.judge?.status === "scored" ? (
                               <div className="score-card">
                                 <div className="score-top">
                                   <div>
@@ -770,12 +770,12 @@ export default function App() {
                                     </strong>
                                   </div>
                                   <span className="score-tag">
-                                    {finding.laya?.model?.includes("demo") ? "SIMULATED EVALUATOR" : "MODEL REVIEW"}
+                                    {finding.judge?.model?.includes("demo") ? "SIMULATED EVALUATOR" : "MODEL REVIEW"}
                                   </span>
                                 </div>
                                 <div className="score-bars">
                                   {Object.entries(
-                                    finding.laya.dimensions || {},
+                                    finding.judge.dimensions || {},
                                   ).map(([key, value]) => (
                                     <div key={key}>
                                       <div>
@@ -790,15 +790,15 @@ export default function App() {
                                   This score is not a probability of
                                   misalignment or a confirmed violation.
                                 </p>
-                                {finding.laya.semantic_accuracy_validated === false && (
-                                  <p>Experimental judgement: semantic accuracy is not validated. The current Laya checkpoint has a known authorised-control false positive.</p>
+                                {finding.judge.semantic_accuracy_validated === false && (
+                                  <p>Experimental judgement: semantic accuracy is not validated. Historical scores are uncalibrated and do not establish production accuracy.</p>
                                 )}
                                 {run.legacy && <p>Historical assessment: limited context and simulated scores have not been revalidated.</p>}
                               </div>
                             ) : (
                               <div className="model-unavailable">
-                                {finding.laya
-                                  ? `Judgement unavailable (${finding.laya.reason || "no score"}${finding.laya.validation_error ? `: ${finding.laya.validation_error}` : ''}).`
+                                {finding.judge
+                                  ? `Judgement unavailable (${finding.judge.reason || "no score"}${finding.judge.validation_error ? `: ${finding.judge.validation_error}` : ''}).`
                                   : "Provisional finding. Waiting for the decision model…"}{" "}
                                 The observed evidence remains available.
                               </div>
@@ -827,11 +827,11 @@ export default function App() {
                                 <div key={item.revision}>
                                   <b>r{item.revision}</b>
                                   <span>
-                                    {item.laya?.status === "assessed" ? "Structured model assessment" : item.laya?.status === "scored"
-                                      ? item.laya.model?.includes("demo")
+                                    {item.judge?.status === "assessed" ? "Structured model assessment" : item.judge?.status === "scored"
+                                      ? item.judge.model?.includes("demo")
                                         ? "Simulated evaluator"
                                         : "Model evaluation"
-                                      : item.laya
+                                      : item.judge
                                         ? "Model unavailable"
                                         : "Provisional evidence finding"}
                                   </span>

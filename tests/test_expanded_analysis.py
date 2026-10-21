@@ -10,7 +10,7 @@ from pathlib import Path
 from traceward.context import codex_session, permissions, hook_context
 from traceward.engine import Engine
 from traceward.graph import EvidenceGraph
-from traceward.laya import packet, model_input
+from traceward.evidence_packet import packet, model_input
 from traceward.ocsf import EvidenceStore, project
 from traceward.state import StateObserver, content_redact
 from traceward.structured import FACETS, validate_response, factual_predicates

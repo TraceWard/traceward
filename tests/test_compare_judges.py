@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from demo.compare_judges import call, dataset, digest, reference_payload, reference_result, result_disposition, summarise
+from demo.compare_judges import call, dataset, digest, reference_payload, reference_result, summarise
 
 
 class ComparisonTests(unittest.TestCase):
@@ -22,7 +22,7 @@ class ComparisonTests(unittest.TestCase):
         def post(request, **kwargs):
             requests.append(request)
             return Reply()
-        with patch.dict('os.environ', {'UNSLOTH_TOKEN': 'observer-only'}), patch('demo.compare_judges.urlopen', post):
+        with patch.dict('os.environ', {'TRACEWARD_JUDGE_TOKEN': 'observer-only'}), patch('demo.compare_judges.urlopen', post):
             result = call('http://localhost:1234/v1/chat/completions', {}, token='')
         self.assertNotIn('Authorization', dict(requests[0].header_items()))
         self.assertNotIn('observer-only', json.dumps(result))
@@ -45,13 +45,6 @@ class ComparisonTests(unittest.TestCase):
             self.assertTrue(all(digest({k: v for k, v in c['packet'].items() if k != 'authorised_goal'}) == digest(original) for c in controls))
             self.assertEqual(sum(c['expected'] == 'consistent_with_goal' for c in controls), 3)
             self.assertEqual(sum(not c['counterfactual'] for c in controls), 1)
-
-    def test_choice_maps_semantic_labels_independent_of_order(self):
-        answer = {'answers': {'decision': {'type': 'choice', 'choice': 'B', 'probabilities': {'C': .1, 'B': .8, 'A': .1}}}}
-        self.assertEqual(result_disposition(answer, 'reversed_choice')[0], 'review_required')
-        answer['answers']['decision']['choice'] = 'A'
-        with self.assertRaises(ValueError):
-            result_disposition(answer, 'direct_choice')
 
     def test_unavailable_and_inconclusive_do_not_count_as_correct(self):
         rows = [{'requested_model': 'test', 'variant': 'baseline', 'case_id': f'legitimate-1-{i}',

@@ -27,9 +27,9 @@ class PiTests(unittest.TestCase):
     def test_pi_development_options_are_explicit_and_validated(self):
         parsed = _parse_run(['--guest-image', 'traceward-pi-dev:local', '--pi-network', 'bridge',
                              'pi', '--print', 'Inspect the project'])
-        self.assertEqual(parsed[5], 'traceward-pi-dev:local')
+        self.assertEqual(parsed[4], 'traceward-pi-dev:local')
         self.assertEqual(parsed[-1]['pi_network'], 'bridge')
-        self.assertEqual(parsed[2], ['--print', 'Inspect the project'])
+        self.assertEqual(parsed[1], ['--print', 'Inspect the project'])
         for network in ['host', 'invalid', '']:
             with self.subTest(network=network), self.assertRaisesRegex(ValueError, '--pi-network'):
                 _parse_run(['--pi-network', network, 'pi', '--print', 'Inspect the project'])
@@ -57,11 +57,11 @@ class PiTests(unittest.TestCase):
         args = ['--print', 'Start by inspecting the tests']
         parsed = _parse_run(['--goal', 'Complete the full refactor', 'pi', *args])
         self.assertEqual(parsed[0], 'Complete the full refactor')
-        self.assertEqual(parsed[2], args)
+        self.assertEqual(parsed[1], args)
         with patch('builtins.input') as ask:
             parsed = _parse_run(['--goal', 'Complete the full refactor', 'pi'])
         ask.assert_not_called()
-        self.assertEqual(parsed[2], [])
+        self.assertEqual(parsed[1], [])
 
     def test_pi_goal_file_sets_scope_without_changing_agent_arguments(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -69,7 +69,7 @@ class PiTests(unittest.TestCase):
             file.write_text('Complete the refactor.\nKeep tests intact.\n')
             parsed = _parse_run(['--goal-file', str(file), 'pi', '--print', 'Inspect README.md'])
         self.assertEqual(parsed[0], 'Complete the refactor.\nKeep tests intact.\n')
-        self.assertEqual(parsed[2], ['--print', 'Inspect README.md'])
+        self.assertEqual(parsed[1], ['--print', 'Inspect README.md'])
 
     def test_initial_instruction_is_first_message_not_option_values_or_later_messages(self):
         args = ['--print', '--mode', 'json', '--session', '/pi-home/session.jsonl',
@@ -77,7 +77,7 @@ class PiTests(unittest.TestCase):
         with patch('sys.stdin', io.StringIO('')):
             parsed = _parse_run(['pi', *args])
         self.assertEqual(parsed[0], 'Fix arithmetic')
-        self.assertEqual(parsed[2], args)
+        self.assertEqual(parsed[1], args)
 
     def test_pi_interactive_start_waits_for_chat_without_wrapper_prompt(self):
         with patch('sys.stdin.isatty', return_value=True), \
@@ -85,13 +85,13 @@ class PiTests(unittest.TestCase):
             parsed = _parse_run(['pi'])
         ask.assert_not_called()
         self.assertIsNone(parsed[0])
-        self.assertEqual(parsed[2], [])
+        self.assertEqual(parsed[1], [])
 
     def test_pi_stdin_instruction_reaches_the_agent(self):
         with patch('sys.stdin', io.StringIO('Create hello.py\n')):
             parsed = _parse_run(['pi', '--print'])
         self.assertEqual(parsed[0], 'Create hello.py\n')
-        self.assertEqual(parsed[2], ['--print', '--', 'Create hello.py\n'])
+        self.assertEqual(parsed[1], ['--print', '--', 'Create hello.py\n'])
 
     def test_pi_modes_without_reliable_initial_text_are_rejected(self):
         for args in [['--continue', 'Fix tests'], ['--resume', 'Fix tests'],
@@ -111,7 +111,7 @@ class PiTests(unittest.TestCase):
     def test_pi_flags_preserve_operator_prompt_and_do_not_change_codex(self):
         parsed = _parse_run(['--defer-judge', '--pi-seed', '7',
                              'pi', '--print', '--tools', 'read,bash', 'literal $()` text'])
-        self.assertEqual(parsed[2], ['--print', '--tools', 'read,bash', 'literal $()` text'])
+        self.assertEqual(parsed[1], ['--print', '--tools', 'read,bash', 'literal $()` text'])
         self.assertEqual(parsed[0], 'literal $()` text')
         self.assertEqual(parsed[-1], {'agent': 'pi', 'defer_evaluation': True, 'pi_seed': 7})
         with self.assertRaisesRegex(ValueError, 'require the pi'):

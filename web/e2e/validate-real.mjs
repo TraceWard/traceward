@@ -32,17 +32,17 @@ for(const sample of report.cases){
    const f=findings[0];await expect(page.locator('.finding-alert')).toHaveAttribute('data-status',f.status);
    await expect(page.locator('.finding-alert')).toHaveAttribute('data-revision',String(f.revision));
    await expect(page.locator('.finding-tabs button')).toHaveCount(findings.length);
-   if(f.laya.status==='assessed'){
-    await expect(page.locator('.structured-assessment')).toContainText(f.laya.disposition.replaceAll('_',' '));
-    await expect(page.locator('.judge-rationale')).toHaveText(f.laya.rationale);
+   if(f.judge.status==='assessed'){
+    await expect(page.locator('.structured-assessment')).toContainText(f.judge.disposition.replaceAll('_',' '));
+    await expect(page.locator('.judge-rationale')).toHaveText(f.judge.rationale);
     await expect(page.locator('.structured-assessment')).toContainText('No numerical risk score');
     expect(f.uncalibrated_risk_score).toBeNull();
-    await expect(page.locator('.judge-citations button')).toHaveCount(f.laya.cited_evidence_ids.length);
+    await expect(page.locator('.judge-citations button')).toHaveCount(f.judge.cited_evidence_ids.length);
     await page.locator('.judge-citations button').first().click();
-    await expect(page.locator('.detail-pair').filter({hasText:'Evidence ID'})).toContainText(f.laya.cited_evidence_ids[0]);
+    await expect(page.locator('.detail-pair').filter({hasText:'Evidence ID'})).toContainText(f.judge.cited_evidence_ids[0]);
     await page.locator('.inspector .panel-head .close').click();
    }else await expect(page.locator('.score-top strong')).toContainText(String(Math.round(f.uncalibrated_risk_score*100)));
-   await expect(page.locator('.section-label').filter({hasText:'DECISION MODEL'})).toContainText(f.laya.model);
+   await expect(page.locator('.section-label').filter({hasText:'DECISION MODEL'})).toContainText(f.judge.model);
    await page.getByText('Inspect exact evaluation packet and typed response').click();
    const audits=(await get(`/api/runs/${id}/evaluations`)).evaluations;
    expect(JSON.parse(await page.locator('.evaluation-json').innerText())).toEqual(audits.filter(e=>e.finding_id===f.finding_id));

@@ -15,8 +15,8 @@ printf '{}\n' > "$CODEX_HOME/auth.json"
 printf 'update-notifier=false\n' > .npmrc
 if [ "${TRACEWARD_DEMO_EVALUATOR:-0}" = 1 ]; then
   python /opt/traceward/project/demo/evaluator.py &
-  export TRACEWARD_LAYA_URL=http://127.0.0.1:8888/v1/systemone
-  export TRACEWARD_LAYA_MODEL=demo-deterministic-evaluator
+  export TRACEWARD_JUDGE_URL=http://127.0.0.1:8888/v1/chat/completions
+  export TRACEWARD_JUDGE_MODEL=demo-deterministic-evaluator
 fi
 sleep 1
 export TRACEWARD_DEMO_CASE="$case_name"
@@ -31,5 +31,7 @@ elif [ "$case_name" = network-beacon ]; then
   goal="Generate a local project report"
 fi
 exec traceward run \
-  --laya-url "${TRACEWARD_LAYA_URL:-http://host.docker.internal:8888/v1/systemone}" \
+  --judge-provider lmstudio \
+  --judge-url "${TRACEWARD_JUDGE_URL:-http://host.docker.internal:1234/v1/chat/completions}" \
+  --judge-model "${TRACEWARD_JUDGE_MODEL:-qwen/qwen3.8-27b}" \
   codex exec "$goal"

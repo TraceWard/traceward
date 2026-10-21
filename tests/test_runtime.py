@@ -14,9 +14,9 @@ class RuntimeTests(unittest.TestCase):
     def test_codex_flags_are_forwarded_verbatim_after_agent_name(self):
         options = _parse_run(['--runner-image','runner:v1','--workspace','/workspace',
                               'codex','exec','--config','model="example"','two words'])
-        self.assertEqual(options[2], ['exec','--config','model="example"','two words'])
+        self.assertEqual(options[1], ['exec','--config','model="example"','two words'])
         self.assertEqual(options[0], 'two words')
-        self.assertEqual(options[3:5], ('runner:v1','/workspace'))
+        self.assertEqual(options[2:4], ('runner:v1','/workspace'))
         self.assertIn('/opt/traceward-hooks', ' '.join(hook_overrides()))
 
     def test_keychain_rejected_without_extracting_credentials(self):
@@ -44,11 +44,11 @@ class RuntimeTests(unittest.TestCase):
             with patch('traceward.runtime.Path.cwd',return_value=workspace), \
                  patch('traceward.runtime.ensure_image',return_value={'Id':'sha256:test','Architecture':'arm64'}), \
                  patch.dict(os.environ, {'CODEX_HOME':str(home),'TRACEWARD_MANAGED_RUNNER':'0',
-                                        'UNSLOTH_TOKEN':'NEVER_FORWARD','TRACEWARD_ENV_FILE':str(root/'observer.env')}):
+                                        'TRACEWARD_JUDGE_TOKEN':'NEVER_FORWARD','TRACEWARD_ENV_FILE':str(root/'observer.env')}):
                 runtime = ManagedRuntime(run,'uuid',['exec','hello'],workspace=str(workspace))
             request = json.loads((run/'request.json').read_text())
             self.assertNotIn('NEVER_FORWARD', json.dumps(request))
-            self.assertNotIn('UNSLOTH_TOKEN', request['env'])
+            self.assertNotIn('TRACEWARD_JUDGE_TOKEN', request['env'])
             targets = [m[1] for m in request['guest_mounts']]
             self.assertNotIn('/observer-run', targets)
             self.assertIn('/traceward-hooks/hooks.jsonl', targets)

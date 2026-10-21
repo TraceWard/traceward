@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from traceward_pi.http_capture import Capture,LIMIT
 from traceward.ocsf import project
-from traceward.laya import packet,model_input
+from traceward.evidence_packet import packet,model_input
 from traceward.structured import factual_predicates
 
 

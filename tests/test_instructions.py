@@ -20,13 +20,13 @@ class InstructionTests(unittest.TestCase):
                 '-mactor', '  Fix tests.\nDo not edit private files.  ']
         parsed = _parse_run(['codex', *args])
         self.assertEqual(parsed[0], args[-1])
-        self.assertEqual(parsed[2], args)
+        self.assertEqual(parsed[1], args)
 
     def test_literal_prompt_can_look_like_an_option_or_command(self):
         for text in ['--goal is a string in this task', 'resume']:
             parsed = _parse_run(['codex', 'exec', '--', text])
             self.assertEqual(parsed[0], text)
-            self.assertEqual(parsed[2], ['exec', '--', text])
+            self.assertEqual(parsed[1], ['exec', '--', text])
 
     def test_interactive_instruction_is_asked_once_and_sent_to_agent(self):
         with patch('sys.stdin.isatty', return_value=True), \
@@ -34,18 +34,18 @@ class InstructionTests(unittest.TestCase):
             parsed = _parse_run(['codex', '--sandbox', 'workspace-write'])
         ask.assert_called_once_with('Initial instruction: ')
         self.assertEqual(parsed[0], '- Fix the arithmetic')
-        self.assertEqual(parsed[2], ['--sandbox', 'workspace-write', '--', parsed[0]])
+        self.assertEqual(parsed[1], ['--sandbox', 'workspace-write', '--', parsed[0]])
 
     def test_stdin_instruction_is_frozen_and_forwarded_without_trimming(self):
         for args in [[], ['exec'], ['exec', '-']]:
             with self.subTest(args=args), patch('sys.stdin', io.StringIO('Fix arithmetic\n')):
                 parsed = _parse_run(['codex', *args])
             self.assertEqual(parsed[0], 'Fix arithmetic\n')
-            self.assertEqual(parsed[2][-1], parsed[0])
-            self.assertNotIn('-', parsed[2])
+            self.assertEqual(parsed[1][-1], parsed[0])
+            self.assertNotIn('-', parsed[1])
         with patch('sys.stdin', io.StringIO('-- Fix arithmetic')):
             parsed = _parse_run(['codex', 'exec', '-'])
-        self.assertEqual(parsed[2], ['exec', '--', '-- Fix arithmetic'])
+        self.assertEqual(parsed[1], ['exec', '--', '-- Fix arithmetic'])
 
     def test_no_instruction_or_mixed_input_does_not_launch_runtime(self):
         for args, data in [(['codex', 'exec'], ''), (['codex', 'exec', 'Fix tests'], 'other goal')]:
@@ -61,7 +61,7 @@ class InstructionTests(unittest.TestCase):
         with patch('sys.stdin', stream):
             parsed = _parse_run(['--goal', 'Repair the entire billing workflow', 'codex', *args])
         self.assertEqual(parsed[0], 'Repair the entire billing workflow')
-        self.assertEqual(parsed[2], args)
+        self.assertEqual(parsed[1], args)
         self.assertEqual(stream.tell(), 0)
 
     def test_explicit_goal_does_not_require_a_launch_instruction(self):
@@ -70,7 +70,7 @@ class InstructionTests(unittest.TestCase):
                 parsed = _parse_run(['--goal', 'Maintain the project', 'codex', *args])
             ask.assert_not_called()
             self.assertEqual(parsed[0], 'Maintain the project')
-            self.assertEqual(parsed[2], args)
+            self.assertEqual(parsed[1], args)
 
     def test_goal_file_is_read_once_and_keeps_multiline_scope(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -80,7 +80,7 @@ class InstructionTests(unittest.TestCase):
             parsed = _parse_run(['--goal-file', str(file), 'codex', 'Start with the tests'])
             file.write_text('A later edit must not change this run')
         self.assertEqual(parsed[0], goal)
-        self.assertEqual(parsed[2], ['Start with the tests'])
+        self.assertEqual(parsed[1], ['Start with the tests'])
 
     def test_invalid_goal_overrides_fail_without_inference_or_launch(self):
         with tempfile.TemporaryDirectory() as directory:

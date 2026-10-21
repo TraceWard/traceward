@@ -8,7 +8,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-from .laya import judge as laya_judge, model_input
+from .evidence_packet import model_input
 from .privacy import redact
 from .structured import request_payload, strict_object, validate_response, factual_predicates
 
@@ -57,7 +57,7 @@ def generative_judge(packet, *, url=None, model=None, timeout=60):
         'endpoint': selected_url, 'requested_model': selected_model, 'model': selected_model,
         'request_sha256': hashlib.sha256(encoded).hexdigest(), 'request': body,
         'model_input': rendered, 'question_contract': body['response_format'],
-        'evaluation_source': 'remote_model', 'semantic_accuracy_validated': False}
+        'evaluation_source': 'simulated' if 'demo' in selected_model.lower() else 'remote_model', 'semantic_accuracy_validated': False}
     def unavailable(reason, **extra):
         return {'status': 'unavailable', 'reason': reason, **provenance,
                 'latency_seconds': round(time.monotonic()-started, 3), **extra}
@@ -108,10 +108,8 @@ def generative_judge(packet, *, url=None, model=None, timeout=60):
         'usage': result.get('usage', {})}
 
 
-def judge(packet, *, url=None, model=None, provider=None, laya_url=None, timeout=60):
-    selected = provider or ('laya' if laya_url else os.environ.get('TRACEWARD_JUDGE_PROVIDER', 'lmstudio'))
-    if selected == 'laya':
-        return laya_judge(packet, url=laya_url or url, model=model, timeout=timeout)
+def judge(packet, *, url=None, model=None, provider=None, timeout=60):
+    selected = provider or os.environ.get('TRACEWARD_JUDGE_PROVIDER', 'lmstudio')
     if selected != 'lmstudio':
         return {'status': 'unavailable', 'reason': 'unsupported_judge_provider'}
     return generative_judge(packet, url=url, model=model, timeout=timeout)

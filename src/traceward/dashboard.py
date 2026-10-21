@@ -14,6 +14,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .cli import state_root
+from .records import assessment_record
 
 
 def _run_id(value: str) -> str:
@@ -205,11 +206,11 @@ class RunIndex:
         finding_title = reviews[0]['title'] if reviews else None
         if not assessments:
             evaluation_label = "No consequential episode assessed"
-        elif any("demo" in f.get("laya", {}).get("model", "") or f.get("laya", {}).get("evaluation_source") == "simulated" for f in assessments):
-            evaluation_label = "Simulated evaluator · not Laya"
-        elif all(f.get("laya", {}).get("status") in {"scored", "assessed"} for f in assessments):
+        elif any("demo" in f.get("judge", {}).get("model", "") or f.get("judge", {}).get("evaluation_source") == "simulated" for f in assessments):
+            evaluation_label = "Simulated evaluator · not a model assessment"
+        elif all(f.get("judge", {}).get("status") in {"scored", "assessed"} for f in assessments):
             evaluation_label = "Model assessed"
-        elif any(f.get("laya", {}).get("status") == "unavailable" for f in assessments):
+        elif any(f.get("judge", {}).get("status") == "unavailable" for f in assessments):
             evaluation_label = "Model unavailable"
         else:
             evaluation_label = "Assessment pending"
@@ -266,10 +267,10 @@ class RunIndex:
               WHERE f.run_id=? ORDER BY f.time_s DESC""", (_run_id(run_id), run_id)).fetchall()
             results = []
             for row in rows:
-                finding = json.loads(row["body"])
+                finding = assessment_record(json.loads(row["body"]))
                 revisions = self.db.execute("""SELECT body FROM findings WHERE run_id=? AND finding_id=?
                   ORDER BY revision""", (run_id, finding["finding_id"])).fetchall()
-                finding["revisions"] = [json.loads(rev["body"]) for rev in revisions]
+                finding["revisions"] = [assessment_record(json.loads(rev["body"])) for rev in revisions]
                 results.append(finding)
             return results
 

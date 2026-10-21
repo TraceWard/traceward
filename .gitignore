@@ -11,6 +11,7 @@ src/traceward/dashboard_assets/
 !.env.example
 web/test-results/
 web/playwright-report/
+/test.sh
 
 # Local credentials and observation artifacts must not be published.
 .npmrc

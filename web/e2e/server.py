@@ -68,7 +68,7 @@ def live(phase: str):
    'time':time.time(),'title':'Unexpected POST to example.com',
    'status':'review_required' if phase=='review' else 'provisional',
    **({'analysis_window':{'start':observed-5,'end':observed+10,'duration_seconds':30,'stride_seconds':1,'agent_finished':False},
-       'laya':{'status':'assessed','contract_version':'goal-effects-live-v1','model':'synthetic-live-regression',
+       'judge':{'status':'assessed','contract_version':'goal-effects-live-v1','model':'synthetic-live-regression',
                'disposition':'review_required','rationale':'Synthetic prohibited request.','cited_evidence_ids':['live-http']}} if phase=='review' else {}),
    'observed_effects':['http_request'],'evidence_ids':['live-http']})
  return {'ok':True,'summary_exists':(live_folder/'summary.json').exists()}
@@ -82,10 +82,10 @@ def revision(mode:str):
      'title':title,'evidence_ids':evidence_ids,'observed_effects':effects,'status':'review_required'})
   return {'ok':True}
  final = {**base,'revision':3 if mode=='unavailable' else 2,'time':106,'status':'inconclusive' if mode=='unavailable' else 'review_required', 'uncalibrated_risk_score':None if mode=='unavailable' else .83,
- 'laya':{'status':'unavailable','reason':'fixture_outage'} if mode=='unavailable' else {'status':'scored','model':'demo-browser-regression','dimensions':{'goal_relevance':.2,'unexplained_effect':.9,'discrepancy':.8}}}
+ 'judge':{'status':'unavailable','reason':'fixture_outage'} if mode=='unavailable' else {'status':'scored','model':'demo-browser-regression','dimensions':{'goal_relevance':.2,'unexplained_effect':.9,'discrepancy':.8}}}
  if mode in {'structured','citations'}:
   final.update({'revision':4,'time':107,'status':'consistent_with_goal','uncalibrated_risk_score':None,
-    'laya':{'status':'assessed','model':'demo-structured-qwen','provider':'synthetic-regression',
+    'judge':{'status':'assessed','model':'demo-structured-qwen','provider':'synthetic-regression',
       'disposition':'consistent_with_goal','rationale':'The synthetic goal explicitly requests these fixture operations.',
       'cited_evidence_ids':['file-299','send'],'semantic_accuracy_validated':False}})
   final['assessment']={name:{'status':'supported','summary':'Synthetic supported context','evidence_ids':['send']}
@@ -97,7 +97,7 @@ def revision(mode:str):
   final.update({'revision': 5 if mode=='review' else 6, 'time':108 if mode=='review' else 109,
     'status':'review_required' if mode=='review' else 'consistent_with_goal'})
  store.finding(final)
- store.evaluations.append({'finding_id':final['finding_id'],'revision':final['revision'],'packet':{'goal':'Synthetic browser regression','evidence_ids':base['evidence_ids'],'causal_links':[{'parent':'shell','child':'child'}]},'judgement':final['laya']})
+ store.evaluations.append({'finding_id':final['finding_id'],'revision':final['revision'],'packet':{'goal':'Synthetic browser regression','evidence_ids':base['evidence_ids'],'causal_links':[{'parent':'shell','child':'child'}]},'judgement':final['judge']})
  (folder/'summary.json').write_text(json.dumps({'goal':'Synthetic browser regression','codex_exit_code':0,'coverage_gaps':['Synthetic regression coverage gap','collector connection lost (synthetic test)']}))
  return {'ok':True}
 uvicorn.run(app,host='127.0.0.1',port=8779,access_log=False)

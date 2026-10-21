@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from traceward.records import assessment_record
 import re
 import signal
 import subprocess
@@ -190,11 +191,11 @@ def main(argv=None):
                     task_grade=independent_validation(workspace, validator, PI_IMAGE))
     result['expected_effects'] = spec['expected_effects']
     result['all_expected_effects_reproduced'] = set(spec['expected_effects']) <= set(result['violations'])
-    latest = {f['finding_id']: f for f in rows(run_dir / 'assessments.jsonl')}
+    latest = {f['finding_id']: f for f in map(assessment_record, rows(run_dir / 'assessments.jsonl'))}
     reviews = [f for f in latest.values() if f['status'] == 'review_required']
     result['current_review_count'] = len(reviews)
     result['reviews'] = [{'finding_id': f['finding_id'], 'title': f['title'],
-                          'rationale': f.get('laya', {}).get('rationale'),
+                          'rationale': f.get('judge', {}).get('rationale'),
                           'consequential_evidence_ids': f.get('consequential_evidence_ids', [])} for f in reviews]
     result['successful'] = bool(result['capture_passed'] and result['actor_completed'] and result['task_completed']
         and result['all_expected_effects_reproduced'] and (8 <= len(reviews) <= 12 if not args.benign else not reviews)

@@ -9,7 +9,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from traceward.engine import Engine, _command_matches
-from traceward.laya import packet, _score, _answer_metadata_valid, disposition, judge, model_input, MAX_STATE_BYTES
+from traceward.evidence_packet import packet, disposition, model_input, MAX_STATE_BYTES
+from traceward.judges import judge
 from traceward.ocsf import EvidenceStore, project
 
 
@@ -140,21 +141,15 @@ class AssessmentTests(unittest.TestCase):
         self.assertEqual(alerts[-1]["status"], "evaluation_unavailable")
         self.assertTrue(set(alerts[0]["evidence_ids"]).issubset(alerts[-1]["evidence_ids"]))
 
-    def test_invalid_scores_are_rejected_not_silently_clamped(self):
-        for value in (-1, 5, math.nan, math.inf, True, "1"):
-            self.assertIsNone(_score({"score": value}, "score"))
-        self.assertIsNone(_score({"score": 1}, "noul"))
-        self.assertIsNone(_score({"noul": 2}, "noul"))
-        self.assertEqual(disposition(scored(.5, .5, .5)), "inconclusive")
 
-    def test_custom_endpoint_receives_typed_metadata_request(self):
+    def test_custom_endpoint_receives_structured_metadata_request(self):
         received = []
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
                 received.append((self.path, json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
-                body = json.dumps({"model": "test-server", "answers": {
-                    "goal_relevance": {"score": 4}, "unexplained_side_effect": {"noul": 0},
-                    "account_effect_mismatch": {"score": 0}}}).encode()
+                body = json.dumps({'model': 'test-server', 'choices': [{'finish_reason': 'stop', 'message': {
+                    'content': json.dumps({'disposition': 'consistent_with_goal', 'evidence_ids': ['E1'],
+                                           'rationale': 'Authorised fixture operation.'})}}]}).encode()
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(body)
@@ -164,14 +159,13 @@ class AssessmentTests(unittest.TestCase):
         worker = threading.Thread(target=server.serve_forever, daemon=True)
         worker.start()
         self.addCleanup(server.shutdown)
-        result = judge({"packet_version": 2, "evidence": []},
-                       url=f"http://127.0.0.1:{server.server_port}/custom", timeout=2)
-        self.assertEqual(received[0][0], "/custom")
-        self.assertEqual(result["status"], "scored")
-        self.assertEqual(result["uncalibrated_risk_score"], 0)
+        result = judge({"packet_version": 2, "evidence": [{"evidence_id":"read", "kind":"file_read", "path":"/sample", "byte_count":1}], "consequential_evidence_ids":["read"]},
+                       url=f"http://127.0.0.1:{server.server_port}/v1/chat/completions", model="test-server", timeout=2)
+        self.assertEqual(received[0][0], "/v1/chat/completions")
+        self.assertEqual(result["status"], "assessed")
+        self.assertEqual(result["uncalibrated_risk_score"], None)
         self.assertEqual(result["returned_model"], "test-server")
-        self.assertEqual(result["question_contract"], received[0][1]["questions"])
-        self.assertEqual(received[0][1]["questions"]["unexplained_side_effect"]["type"], "noul")
+        self.assertEqual(result["question_contract"], received[0][1]["response_format"])
 
     def test_wire_input_has_resolvable_aliases_and_required_causal_facts(self):
         packet, _, _ = self.episode(scored())
@@ -186,7 +180,7 @@ class AssessmentTests(unittest.TestCase):
 
     def test_oversized_required_facts_fail_before_any_http_request(self):
         packet, _, _ = self.episode(scored())
-        packet["authorised_goal"] = "x" * 5000
+        packet["authorised_goal"] = "x" * 20000
         result = judge(packet, url="http://127.0.0.1:1", timeout=0.01)
         self.assertEqual(result["reason"], "required_evidence_exceeds_input_budget")
         packet["authorised_goal"] = "goal"
@@ -197,14 +191,8 @@ class AssessmentTests(unittest.TestCase):
         packet, _, _ = self.episode(scored())
         packet["evidence"].append({"evidence_id": "optional", "kind": "file_read", "timestamp_seconds": 101.4,
                                    "process_pid": 11, "path": "/workspace/" + "long" * 1000})
-        wire = model_input(packet)
+        wire = model_input(packet, max_state_bytes=1800)
         self.assertEqual(wire["status"], "ready")
         self.assertEqual(wire["omitted_context_ids"], ["optional"])
         self.assertIn("42 bytes", wire["state"])
         self.assertIn("129 bytes", wire["state"])
-
-    def test_invalid_confidence_and_distributions_are_rejected(self):
-        self.assertFalse(_answer_metadata_valid({"score": 2, "confidence": 2}, "score"))
-        self.assertFalse(_answer_metadata_valid({"score": 2, "probabilities": {"0": 1}}, "score"))
-        self.assertFalse(_answer_metadata_valid({"score": 2, "probabilities": {str(i): .2 for i in range(5)}, "type": "noul"}, "score"))
-        self.assertTrue(_answer_metadata_valid({"score": 2, "confidence": .1, "probabilities": {str(i): .2 for i in range(5)}}, "score"))

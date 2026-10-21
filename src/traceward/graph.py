@@ -78,6 +78,27 @@ class EvidenceGraph:
             self.db.execute('INSERT OR IGNORE INTO edges VALUES (?,?,?,?)', (source, target, relation, confidence))
             self.db.commit()
 
+    def attribute(self, item: dict, tool_id: str | None):
+        """Add final tool attribution without reserializing every source event."""
+        from .privacy import redact
+        if tool_id is not None: tool_id = redact(tool_id, 100000)
+        with self.lock:
+            row = self.db.execute('SELECT tool_id FROM observations WHERE id=?', (item['event_id'],)).fetchone()
+            if row is None:
+                self.add({**item, 'tool_use_id': tool_id})
+                return
+            if row[0] == tool_id: return
+            self.db.execute('UPDATE observations SET tool_id=?,payload=json_set(payload,"$.tool_use_id",?) WHERE id=?',
+                            (tool_id, tool_id, item['event_id']))
+            if tool_id:
+                hook = self.db.execute('SELECT id FROM observations WHERE run_id=? AND kind="hook" AND tool_id=? '
+                                      'AND json_extract(payload,"$.event")="PreToolUse" LIMIT 1',
+                                      (self.run_id, tool_id)).fetchone()
+                if hook:
+                    self.db.execute('INSERT OR IGNORE INTO edges VALUES (?,?,?,?)',
+                                    (hook[0], item['event_id'], 'tool_effect', 'command_or_resource_time_inference'))
+            self.db.commit()
+
     def related(self, seeds: list[dict], tool_ids: set[str], *, limit=32) -> tuple[list[dict], list[dict], bool]:
         """Bounded connected context; arbitrary prior-run events never enter by path alone."""
         paths = {e.get('path') for e in seeds if e.get('path')}

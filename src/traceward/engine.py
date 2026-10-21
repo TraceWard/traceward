@@ -922,11 +922,14 @@ class Engine:
             self.add_gap(f"{len(unmatched)} shell tool hook(s) lacked a process attribution")
         if self.graph and not self.assessments_cancelled:
             for e in self.effects:
+                if self.assessments_cancelled:
+                    self.add_gap('final graph attribution interrupted; raw evidence retained; graph can be rebuilt')
+                    break
                 tid = self._tool_for(_key(e))
                 if not tid and e['kind'] in {'file_read', 'file_write'}:
                     matches = self._native_matches(e, completed=True)
                     if len(matches) == 1: tid = matches[0]['tool_use_id']
-                self.graph.add({**e, 'tool_use_id': tid})
+                self.graph.attribute(e, tid)
         with self.changed:
             self.finished = True
             self.changed.notify_all()

@@ -93,12 +93,12 @@ def _parse_run(args: list[str], *, instruction_parser=codex_instruction) -> tupl
     return goal, laya_url, agent_args, image, workspace, guest_image, judge_options, agent_options
 
 
-def _tail_lines(path: Path, offset: int, pending: str) -> tuple[list[str], int, str]:
+def _tail_lines(path: Path, offset: int, pending: str, *, limit: int = -1) -> tuple[list[str], int, str]:
     if not path.exists():
         return [], offset, pending
     with path.open("r", encoding="utf-8", errors="replace") as stream:
         stream.seek(offset)
-        chunk = stream.read()
+        chunk = stream.read(limit)
         offset = stream.tell()
     content = pending + chunk
     parts = content.split("\n")
@@ -221,22 +221,32 @@ def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_na
     trace_pending = hook_pending = ""
     http_pos, http_pending = 0, ''
     warned_hooks = False
+    recovered_hooks = False
+    ingestion_interrupted = False
     child = None
     finalizing = False
     shutdown_signal = None
     def forward(signum, _frame):
-        nonlocal shutdown_signal
-        if finalizing:
+        nonlocal shutdown_signal, finalizing
+        if finalizing or (child and child.poll() is not None):
+            finalizing = True
             shutdown_signal = signum
             engine.cancel_assessments()
         elif child and child.poll() is None:
             runtime.signal(child, signum)
     previous = {s: signal.signal(s, forward) for s in (signal.SIGTERM, signal.SIGINT)}
     def drain():
-        nonlocal trace_pos, hook_pos, trace_pending, hook_pending, goal, pending_goal, http_pos, http_pending
-        trace_lines, trace_pos, trace_pending = _tail_lines(trace_file, trace_pos, trace_pending)
-        hook_lines, hook_pos, hook_pending = _tail_lines(hook_file, hook_pos, hook_pending)
+        nonlocal trace_pos, hook_pos, trace_pending, hook_pending, goal, pending_goal, http_pos, http_pending, recovered_hooks, ingestion_interrupted
+        if engine.assessments_cancelled:
+            ingestion_interrupted = True
+            return False
+        # Read bounded chunks so hook delivery, heartbeats and operator signals
+        # are not held behind an entire busy session's syscall backlog.
+        hook_lines, hook_pos, hook_pending = _tail_lines(hook_file, hook_pos, hook_pending, limit=65536)
         for line in hook_lines:
+            if engine.assessments_cancelled:
+                ingestion_interrupted = True
+                return False
             try:
                 item = json.loads(line)
                 if item.get("run_id") == run_id:
@@ -249,12 +259,23 @@ def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_na
                     engine.hook(item)
             except (ValueError, TypeError):
                 engine.add_gap("malformed hook record")
+        if warned_hooks and not recovered_hooks and engine.counts.get('hook'):
+            recovered_hooks = True
+            print(f'TraceWard: {agent} hooks received; the earlier no-hook warning no longer applies.',
+                  file=sys.stderr, flush=True)
+        trace_lines, trace_pos, trace_pending = _tail_lines(trace_file, trace_pos, trace_pending, limit=65536)
         for line in trace_lines:
+            if engine.assessments_cancelled:
+                ingestion_interrupted = True
+                return False
             effect = parser.parse(line)
             if effect:
                 engine.effect(effect)
-        http_lines, http_pos, http_pending = _tail_lines(run_dir/'http-events.jsonl', http_pos, http_pending)
+        http_lines, http_pos, http_pending = _tail_lines(run_dir/'http-events.jsonl', http_pos, http_pending, limit=65536)
         for line in http_lines:
+            if engine.assessments_cancelled:
+                ingestion_interrupted = True
+                return False
             try:
                 item = json.loads(line)
                 if item.get('kind') == 'http_request': engine.observe(item)
@@ -268,6 +289,8 @@ def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_na
             except (ValueError, OSError): engine.add_gap('HTTPS inspection health unavailable')
         for gap in parser.gaps:
             engine.add_gap(gap)
+        return any(path.exists() and offset < path.stat().st_size for path, offset in
+                   ((trace_file, trace_pos), (hook_file, hook_pos), (run_dir/'http-events.jsonl', http_pos)))
     try:
         try:
             child = subprocess.Popen(runtime.command)
@@ -275,17 +298,25 @@ def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_na
                 if time.monotonic() - last_heartbeat >= 2:
                     _write_manifest(run_dir / "run.json", run_id, goal, started_at, agent)
                     last_heartbeat = time.monotonic()
-                drain()
+                more_events = drain()
                 if not warned_hooks and time.monotonic() - started > 15 and not engine.counts.get("hook"):
                     warned_hooks = True
                     instruction = runtime.hook_setup_hint
                     print(f"TraceWard: no {agent} hook received; {instruction}. "
                           "Combined coverage is not established.", file=sys.stderr, flush=True)
-                time.sleep(0.1)
+                if not more_events: time.sleep(0.1)
             exit_code = child.wait()
             finalizing = True
+            if trace_pos < trace_file.stat().st_size:
+                print(f'TraceWard: {agent} has exited; processing remaining captured events. '
+                      'Press Ctrl+C or send SIGTERM again to stop waiting and save partial results.',
+                      file=sys.stderr, flush=True)
             for _ in range(5):
-                drain()
+                while drain():
+                    if time.monotonic() - last_heartbeat >= 2:
+                        _write_manifest(run_dir/'run.json', run_id, goal, started_at, agent)
+                        last_heartbeat = time.monotonic()
+                if engine.assessments_cancelled: break
                 time.sleep(0.05)
         finally:
             finalizing = True
@@ -298,6 +329,10 @@ def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_na
             engine.add_gap("collector failure or rejected/dropped messages; run coverage is incomplete")
         if parser.unparsed:
             engine.add_gap(f"{parser.unparsed} gVisor records could not be normalized")
+        if ingestion_interrupted:
+            engine.add_gap('observation processing interrupted during shutdown; raw source evidence retained; derived views incomplete')
+        elif trace_pending or hook_pending or http_pending:
+            engine.add_gap('incomplete final source record; raw source evidence retained')
         if runtime.permission_log and runtime.permission_log.exists():
             observations, gaps = permissions(runtime.permission_log, workspace=root, run_id=run_id)
             for observation in observations: engine.observe(observation)

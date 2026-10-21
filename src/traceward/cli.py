@@ -222,8 +222,14 @@ def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_na
     http_pos, http_pending = 0, ''
     warned_hooks = False
     child = None
+    finalizing = False
+    shutdown_signal = None
     def forward(signum, _frame):
-        if child and child.poll() is None:
+        nonlocal shutdown_signal
+        if finalizing:
+            shutdown_signal = signum
+            engine.cancel_assessments()
+        elif child and child.poll() is None:
             runtime.signal(child, signum)
     previous = {s: signal.signal(s, forward) for s in (signal.SIGTERM, signal.SIGINT)}
     def drain():
@@ -263,71 +269,86 @@ def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_na
         for gap in parser.gaps:
             engine.add_gap(gap)
     try:
-        child = subprocess.Popen(runtime.command)
-        while child.poll() is None:
-            if time.monotonic() - last_heartbeat >= 2:
-                _write_manifest(run_dir / "run.json", run_id, goal, started_at, agent)
-                last_heartbeat = time.monotonic()
-            drain()
-            if not warned_hooks and time.monotonic() - started > 15 and not engine.counts.get("hook"):
-                warned_hooks = True
-                instruction = runtime.hook_setup_hint
-                print(f"TraceWard: no {agent} hook received; {instruction}. "
-                      "Combined coverage is not established.", file=sys.stderr, flush=True)
-            time.sleep(0.1)
-        exit_code = child.wait()
-        for _ in range(5):
-            drain()
-            time.sleep(0.05)
-    finally:
-        for s, handler in previous.items():
-            signal.signal(s, handler)
-        runtime.cleanup()
-    status_path = run_dir / "runtime-status.json"
-    status = json.loads(status_path.read_text()) if status_path.exists() else {}
-    if not status.get("handshakes") or not status.get("source_messages"):
-        engine.add_gap("gVisor telemetry was not established; run coverage is incomplete")
-    if status.get("collector_failed") or status.get("decode_errors") or status.get("collector_dropped_messages"):
-        engine.add_gap("collector failure or rejected/dropped messages; run coverage is incomplete")
-    if parser.unparsed:
-        engine.add_gap(f"{parser.unparsed} gVisor records could not be normalized")
-    if runtime.permission_log and runtime.permission_log.exists():
-        observations, gaps = permissions(runtime.permission_log, workspace=root, run_id=run_id)
-        for observation in observations: engine.observe(observation)
-        for gap in gaps: engine.add_gap(gap)
-    for observation in states.end(): engine.observe(observation)
-    for gap in set(states.gaps): engine.add_gap(gap)
-    if context_mode == 'redacted' and agent == 'codex':
-        sessions = {h.get('session_id') for h in engine.hooks if h.get('session_id')}
-        for identity in sessions:
-            try: uuid.UUID(identity)
-            except (ValueError, TypeError):
-                engine.add_gap('invalid Codex session identity; semantic context not imported'); continue
-            matches = list((runtime.home / 'sessions').rglob('*' + identity + '*.jsonl'))[:2]
-            if len(matches) != 1:
-                engine.add_gap('Codex session context file missing or ambiguous'); continue
-            try: observations, gaps = codex_session(matches[0], expected_session_id=identity)
-            except (OSError, ValueError):
-                engine.add_gap('Codex session context could not be safely read'); continue
+        try:
+            child = subprocess.Popen(runtime.command)
+            while child.poll() is None:
+                if time.monotonic() - last_heartbeat >= 2:
+                    _write_manifest(run_dir / "run.json", run_id, goal, started_at, agent)
+                    last_heartbeat = time.monotonic()
+                drain()
+                if not warned_hooks and time.monotonic() - started > 15 and not engine.counts.get("hook"):
+                    warned_hooks = True
+                    instruction = runtime.hook_setup_hint
+                    print(f"TraceWard: no {agent} hook received; {instruction}. "
+                          "Combined coverage is not established.", file=sys.stderr, flush=True)
+                time.sleep(0.1)
+            exit_code = child.wait()
+            finalizing = True
+            for _ in range(5):
+                drain()
+                time.sleep(0.05)
+        finally:
+            finalizing = True
+            runtime.cleanup()
+        status_path = run_dir / "runtime-status.json"
+        status = json.loads(status_path.read_text()) if status_path.exists() else {}
+        if not status.get("handshakes") or not status.get("source_messages"):
+            engine.add_gap("gVisor telemetry was not established; run coverage is incomplete")
+        if status.get("collector_failed") or status.get("decode_errors") or status.get("collector_dropped_messages"):
+            engine.add_gap("collector failure or rejected/dropped messages; run coverage is incomplete")
+        if parser.unparsed:
+            engine.add_gap(f"{parser.unparsed} gVisor records could not be normalized")
+        if runtime.permission_log and runtime.permission_log.exists():
+            observations, gaps = permissions(runtime.permission_log, workspace=root, run_id=run_id)
             for observation in observations: engine.observe(observation)
             for gap in gaps: engine.add_gap(gap)
-    if frozen_validator:
-        engine.observe(independent_validation(root, frozen_validator, runtime.image))
-    engine.finish()
-    summary = {**engine.summary(), **runtime.metadata, **status,
-               "run_id": run_id, "agent_exit_code": exit_code,
-               "codex_exit_code": exit_code if agent == 'codex' else None,
-               "wall_seconds": round(time.monotonic() - started, 3),
-               "unparsed_runtime_records": parser.unparsed,
-               "runtime_overhead": "see separate comparable-run measurements"}
-    summary['context_mode'] = context_mode
-    summary['state_snapshot_gaps'] = list(set(states.gaps))
-    path = run_dir / "summary.json"
-    path.write_text(json.dumps(summary, indent=2) + "\n")
-    path.chmod(0o600)
-    print(f"TraceWard: {summary['finding_count']} finding(s), {len(summary['coverage_gaps'])} coverage gap(s). "
-          f"Summary: {path}", file=sys.stderr, flush=True)
-    return exit_code if exit_code >= 0 else 128 - exit_code
+        for observation in states.end(): engine.observe(observation)
+        for gap in set(states.gaps): engine.add_gap(gap)
+        if context_mode == 'redacted' and agent == 'codex':
+            sessions = {h.get('session_id') for h in engine.hooks if h.get('session_id')}
+            for identity in sessions:
+                try: uuid.UUID(identity)
+                except (ValueError, TypeError):
+                    engine.add_gap('invalid Codex session identity; semantic context not imported'); continue
+                matches = list((runtime.home / 'sessions').rglob('*' + identity + '*.jsonl'))[:2]
+                if len(matches) != 1:
+                    engine.add_gap('Codex session context file missing or ambiguous'); continue
+                try: observations, gaps = codex_session(matches[0], expected_session_id=identity)
+                except (OSError, ValueError):
+                    engine.add_gap('Codex session context could not be safely read'); continue
+                for observation in observations: engine.observe(observation)
+                for gap in gaps: engine.add_gap(gap)
+        if frozen_validator:
+            engine.observe(independent_validation(root, frozen_validator, runtime.image))
+        waiting = sum(thread.is_alive() for thread in engine.threads)
+        if waiting and not engine.assessments_cancelled:
+            print(f"TraceWard: {agent} has exited; waiting for {waiting} pending assessment{'s' if waiting != 1 else ''} to finish. "
+                  "Press Ctrl+C or send SIGTERM again to stop waiting and save unfinished assessments as incomplete.",
+                  file=sys.stderr, flush=True)
+        engine.finish()
+        if engine.assessments_cancelled:
+            print("TraceWard: stopped waiting for assessments; captured evidence and existing findings are retained.",
+                  file=sys.stderr, flush=True)
+        summary = {**engine.summary(), **runtime.metadata, **status,
+                   "run_id": run_id, "agent_exit_code": exit_code,
+                   "codex_exit_code": exit_code if agent == 'codex' else None,
+                   "wall_seconds": round(time.monotonic() - started, 3),
+                   "unparsed_runtime_records": parser.unparsed,
+                   "runtime_overhead": "see separate comparable-run measurements"}
+        summary['context_mode'] = context_mode
+        summary['assessment_wait_cancelled'] = engine.assessments_cancelled
+        if shutdown_signal is not None: summary['shutdown_signal'] = shutdown_signal
+        summary['state_snapshot_gaps'] = list(set(states.gaps))
+        path = run_dir / "summary.json"
+        path.write_text(json.dumps(summary, indent=2) + "\n")
+        path.chmod(0o600)
+        print(f"TraceWard: {summary['finding_count']} finding(s), {len(summary['coverage_gaps'])} coverage gap(s). "
+              f"Summary: {path}", file=sys.stderr, flush=True)
+        if shutdown_signal is not None: return 128 + shutdown_signal
+        return exit_code if exit_code >= 0 else 128 - exit_code
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 def watch(run_id: str) -> int:

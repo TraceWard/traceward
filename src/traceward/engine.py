@@ -84,6 +84,8 @@ class Engine:
         self.changed = threading.Condition(self.lock)
         self.event_generation = 0
         self.finished = False
+        self.assessments_cancelled = False
+        self.final_assessments: set[str] = set()
         self.last_arrival = time.monotonic()
         self.post_arrivals: dict[str, float] = {}
         self.execs: list[dict] = []
@@ -719,19 +721,21 @@ class Engine:
             if self.live_windows: self._rolling_assessment(finding, seed)
             else: self._enrich_episode(finding, seed)
         except Exception as exc:
-            # Never leave a silently orphaned provisional candidate after a
-            # packet/worker failure. The source evidence remains authoritative.
-            self.add_gap('assessment worker failed: ' + type(exc).__name__)
-            failed = {**finding, 'revision': self.assessed_packets.get(finding['finding_id'], (1, None))[0] + 1, 'time': time.time(),
-                      'status': 'evaluation_unavailable', 'is_alert': False,
-                      'coverage_gaps': [*self.coverage_gaps],
-                      'laya': {'status': 'unavailable', 'reason': 'assessment_worker_' + type(exc).__name__}}
-            if self.extended_analysis:
-                self.store.assessment(failed)
-                self.review_ids.discard(finding['finding_id'])
-                self.counts['finding'] = len(self.review_ids)
-            else:
-                self.store.finding(failed)
+            with self.changed:
+                if self.assessments_cancelled: return
+                # Never leave a silently orphaned provisional candidate after a
+                # packet/worker failure. The source evidence remains authoritative.
+                self.add_gap('assessment worker failed: ' + type(exc).__name__)
+                failed = {**finding, 'revision': self.assessed_packets.get(finding['finding_id'], (1, None))[0] + 1, 'time': time.time(),
+                          'status': 'evaluation_unavailable', 'is_alert': False,
+                          'coverage_gaps': [*self.coverage_gaps],
+                          'laya': {'status': 'unavailable', 'reason': 'assessment_worker_' + type(exc).__name__}}
+                if self.extended_analysis:
+                    self.store.assessment(failed)
+                    self.review_ids.discard(finding['finding_id'])
+                    self.counts['finding'] = len(self.review_ids)
+                else:
+                    self.store.finding(failed)
 
     def _rolling_assessment(self, finding, seed):
         """Coalesce arrivals while inference runs; never wait for session exit.
@@ -745,9 +749,10 @@ class Engine:
         ready_at = time.monotonic() + min(.25, self.evaluation_wait_seconds)
         while True:
             with self.changed:
-                while not self.finished and (self.defer_evaluation or time.monotonic() < ready_at or self.event_generation == processed_generation):
+                while not self.finished and not self.assessments_cancelled and (self.defer_evaluation or time.monotonic() < ready_at or self.event_generation == processed_generation):
                     delay = max(.01, ready_at-time.monotonic()) if time.monotonic() < ready_at else None
                     self.changed.wait(timeout=.1 if self.defer_evaluation else delay)
+                if self.assessments_cancelled: return
                 generation = self.event_generation
                 updated, packet = self._episode(finding, seed)
                 final = self.finished
@@ -758,6 +763,7 @@ class Engine:
                     continue
             revision = self.assessed_packets.get(finding['finding_id'], (1, None))[0] + 1
             self._assess(updated, packet, revision_number=revision)
+            if self.assessments_cancelled: return
             previous = self.assessed_packets[finding['finding_id']][1]
             processed_generation = generation
             if final: return
@@ -772,39 +778,55 @@ class Engine:
         # A long-running tool is assessed after at most ten seconds with an explicit gap.
         deadline = time.monotonic() + self.evaluation_wait_seconds
         with self.changed:
-            while self.defer_evaluation and not self.finished:
+            while self.defer_evaluation and not self.finished and not self.assessments_cancelled:
                 self.changed.wait(timeout=.1)
-            while not self.finished and time.monotonic() < deadline:
+            while not self.finished and not self.assessments_cancelled and time.monotonic() < deadline:
                 if self._tool_settled(finding['tool_use_id']):
                     break
                 self.changed.wait(timeout=0.1)
+            if self.assessments_cancelled: return
             finding, evidence_packet = self._episode(finding, seed)
         self._assess(finding, evidence_packet, revision_number=2)
         # A preliminary assessment of an active tool is not its final assessment.
         # Re-evaluate once the tool finishes (or runner shuts down), with the final context.
         if not any(e.get("hook_event") == "PostToolUse" for e in evidence_packet["evidence"]):
             with self.changed:
-                while not self.finished:
+                while not self.finished and not self.assessments_cancelled:
                     if self._tool_settled(finding['tool_use_id']):
                         break
                     self.changed.wait(timeout=0.1)
+                if self.assessments_cancelled: return
                 final_finding, final_packet = self._episode(finding, seed)
             if final_packet != evidence_packet:
                 self._assess(final_finding, final_packet, revision_number=3)
 
     def _assess(self, finding: dict, evidence_packet: dict, *, revision_number: int) -> None:
+        if self.assessments_cancelled: return
         try:
             if not self.goal.strip():
                 judgement = {'status': 'unavailable', 'reason': 'initial_user_goal_not_received'}
             else:
-                with self.judge_slots:
+                while not self.judge_slots.acquire(timeout=.1):
+                    if self.assessments_cancelled: return
+                try:
+                    if self.assessments_cancelled: return
                     if self.live_windows and evidence_packet.get('live_window'):
                         with self.changed:
+                            if self.assessments_cancelled: return
                             original, seed = self.candidate_seeds[finding['finding_id']]
                             finding, evidence_packet = self._episode(original, seed)
                     judgement = self.judge_fn(evidence_packet)
+                finally:
+                    self.judge_slots.release()
         except Exception as exc:
             judgement = {"status": "unavailable", "reason": type(exc).__name__}
+        with self.changed:
+            # A request already in flight may finish after the wrapper saved its
+            # summary. Never let that late answer change the frozen run result.
+            if self.assessments_cancelled: return
+            self._record_assessment(finding, evidence_packet, judgement, revision_number)
+
+    def _record_assessment(self, finding, evidence_packet, judgement, revision_number):
         revision = {**finding, "revision": revision_number, "time": time.time(), "laya": judgement}
         revision["uncalibrated_risk_score"] = judgement.get("uncalibrated_risk_score")
         revision["status"] = disposition(judgement)
@@ -836,13 +858,14 @@ class Engine:
                 [*revision["coverage_gaps"], "Decision model judgement unavailable"]
             ))
         if self.extended_analysis:
-            if self.live_windows and revision['status'] == 'evaluation_unavailable' and finding['finding_id'] in self.last_reviews:
+            if (self.live_windows or self.assessments_cancelled) and revision['status'] == 'evaluation_unavailable' and finding['finding_id'] in self.last_reviews:
                 # A failed later assessment cannot refute the earlier valid
                 # review. Keep its original scope/citations and expose failure.
                 prior = self.last_reviews[finding['finding_id']]
                 revision = {**prior, 'revision': revision_number, 'time': revision['time'],
                     'laya': judgement, 'latest_assessment_status': 'evaluation_unavailable',
                     'retained_review_revision': prior['revision'],
+                    'coverage_gaps': list(dict.fromkeys([*prior['coverage_gaps'], *revision['coverage_gaps']])),
                     'assessment_note': 'Earlier supported review retained with its original evidence; the latest model assessment was unavailable and did not clear it.'}
             elif revision['status'] == 'review_required':
                 self.last_reviews[finding['finding_id']] = revision
@@ -862,7 +885,32 @@ class Engine:
                                        "time": revision["time"], "packet": evidence_packet,
                                        "judgement": judgement, "disposition": revision["status"]})
         self.assessed_packets[finding['finding_id']] = (revision_number, evidence_packet)
+        if self.finished: self.final_assessments.add(finding['finding_id'])
         if not self.extended_analysis or revision.get('is_alert'): self.alert_fn(revision)
+
+    def cancel_assessments(self) -> None:
+        """Signal-safe request: no locks, disk writes or waiting in the handler."""
+        self.assessments_cancelled = True
+
+    def _record_cancelled_assessments(self):
+        pending = [(f, seed) for f, seed in self.candidate_seeds.values()
+                   if f['finding_id'] not in self.final_assessments]
+        if not pending: return
+        self.add_gap('pending decision model assessments cancelled during shutdown; final review incomplete')
+        for finding, seed in pending:
+            revision, previous = self.assessed_packets.get(finding['finding_id'], (1, None))
+            evidence = previous or packet(self.goal, finding, seed, self.coverage_gaps)
+            self._record_assessment({**finding, 'episode_complete': False,
+                'coverage_gaps': list(dict.fromkeys([*finding['coverage_gaps'], *self.coverage_gaps]))}, evidence,
+                {'status': 'unavailable', 'reason': 'assessment_cancelled_on_shutdown'}, revision + 1)
+
+    def _join_assessments(self, deadline):
+        for thread in self.threads:
+            while thread.is_alive() and not self.assessments_cancelled and time.monotonic() < deadline:
+                thread.join(timeout=min(.1, max(0, deadline - time.monotonic())))
+            if self.assessments_cancelled: break
+            if thread.is_alive():
+                self.add_gap('evaluation worker did not finish before shutdown')
 
     def finish(self) -> None:
         if self.counts.get("hook", 0) == 0:
@@ -872,7 +920,7 @@ class Engine:
         unmatched.difference_update(self.ambiguous_tools)
         if unmatched:
             self.add_gap(f"{len(unmatched)} shell tool hook(s) lacked a process attribution")
-        if self.graph:
+        if self.graph and not self.assessments_cancelled:
             for e in self.effects:
                 tid = self._tool_for(_key(e))
                 if not tid and e['kind'] in {'file_read', 'file_write'}:
@@ -883,20 +931,29 @@ class Engine:
             self.finished = True
             self.changed.notify_all()
         deadline = time.monotonic() + max(125, 65 * len(self.threads))
-        for thread in self.threads:
-            thread.join(timeout=max(0, deadline - time.monotonic()))
-            if thread.is_alive():
-                self.add_gap("evaluation worker did not finish before shutdown")
-        if self.graph:
+        self._join_assessments(deadline)
+        if self.graph and not self.assessments_cancelled:
             for fid, states in self.state_updates.items():
+                if self.assessments_cancelled: break
                 revision, previous_packet = self.assessed_packets.get(fid, (1, {}))
                 previous_ids = {e['evidence_id'] for e in previous_packet.get('evidence', [])}
                 if any(e['event_id'] not in previous_ids for e in states) and not any(t.is_alive() for t in self.threads):
                     original, seed = self.candidate_seeds[fid]
                     updated, final_packet = self._episode(original, seed)
-                    self._assess(updated, final_packet, revision_number=revision + 1)
+                    self.final_assessments.discard(fid)
+                    # Final state review must also be interruptible while its
+                    # HTTP request is in flight, rather than blocking the CLI.
+                    thread = threading.Thread(target=self._assess, args=(updated, final_packet),
+                        kwargs={'revision_number': revision + 1}, daemon=True)
+                    self.threads.append(thread)
+                    thread.start()
+                    self._join_assessments(deadline)
+        if self.assessments_cancelled:
+            with self.changed:
+                self._record_cancelled_assessments()
         # Keep graph handles alive if an overdue daemon is still auditing.
-        if self.graph and not any(thread.is_alive() for thread in self.threads): self.graph.close()
+        if self.graph and (self.assessments_cancelled or not any(thread.is_alive() for thread in self.threads)):
+            with self.changed: self.graph.close()
 
     def summary(self) -> dict:
         return {

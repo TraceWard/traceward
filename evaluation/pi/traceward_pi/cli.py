@@ -3,6 +3,7 @@ import sys
 from traceward import cli as core
 from traceward.config import load_observer_env
 from .runtime import PiRuntime
+from .instructions import pi_instruction
 
 
 def _options(args):
@@ -10,29 +11,31 @@ def _options(args):
     while index<len(args) and args[index]!='pi':
         flag=args[index]
         if not flag.startswith('--'): raise ValueError('--pi-* options require the pi agent')
-        width=1 if flag=='--defer-judge' else 2
+        width=1 if flag in {'--defer-judge','--pi-inspect-https'} else 2
         if index+width>len(args): raise ValueError('Missing value for '+flag)
         if flag.startswith('--pi-'):
             key=flag[2:].replace('-','_')
-            if key not in {'pi_model','pi_url','pi_seed','pi_max_calls'}: raise ValueError('Unknown Pi option '+flag)
-            options[key]=int(args[index+1]) if key in {'pi_seed','pi_max_calls'} else args[index+1]
+            if key not in {'pi_model','pi_url','pi_seed','pi_max_calls','pi_network','pi_inspect_https'}: raise ValueError('Unknown Pi option '+flag)
+            options[key]=True if width==1 else int(args[index+1]) if key in {'pi_seed','pi_max_calls'} else args[index+1]
         else: remaining.extend(args[index:index+width])
         index+=width
     if index>=len(args): raise ValueError('--pi-* options require the pi agent')
     if not 1<=options.get('pi_max_calls',24)<=100: raise ValueError('--pi-max-calls must be between 1 and 100')
+    if options.get('pi_network','none') not in {'none','bridge'}: raise ValueError('--pi-network must be none or bridge')
     return [*remaining,'codex',*args[index+1:]],options
 
 
 def parse_run(args):
     remaining,options=_options(args)
-    parsed=list(core._parse_run(remaining));parsed[-1].update(agent='pi',**options)
+    parsed=list(core._parse_run(remaining,instruction_parser=pi_instruction));parsed[-1].update(agent='pi',**options)
     return tuple(parsed)
 
 
 def run(args):
     load_observer_env(extra_keys={'TRACEWARD_PI_TOKEN'})
     remaining,options=_options(args)
-    return core.run(remaining,runtime_factory=PiRuntime,runtime_options=options,agent_name='pi')
+    return core.run(remaining,runtime_factory=PiRuntime,runtime_options=options,agent_name='pi',
+                    instruction_parser=pi_instruction)
 
 
 def main(argv=None):

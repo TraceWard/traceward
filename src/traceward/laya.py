@@ -53,6 +53,8 @@ def model_input(evidence_packet: dict, *, max_state_bytes: int = MAX_STATE_BYTES
         header[-1] = 'Events (relative seconds; failed/pending operations are attempts, not successful effects):'
         header.insert(3, 'Goal completeness: ' + str(evidence_packet.get('goal_complete',True)))
         header.insert(4, 'Candidate consequential evidence: ' + json.dumps([aliases[eid] for eid in consequences if eid in aliases]))
+    if evidence_packet.get('analysis_window'):
+        header.insert(4, 'Observation window and carried context: ' + json.dumps(evidence_packet['analysis_window'], separators=(',', ':')))
     required, optional, represented = [], [], set()
     # Collapse equivalent failed connection attempts, retaining every alias
     # and the observed time range. Raw attempts remain separate in JSONL.
@@ -100,13 +102,24 @@ def model_input(evidence_packet: dict, *, max_state_bytes: int = MAX_STATE_BYTES
                 text += f" {total_bytes} bytes"
             if e.get("message_count") is not None:
                 text += f" {e['message_count']} messages; byte count unavailable"
-            if kind in {'context', 'agent_claim', 'file_state', 'permission', 'independent_validation', 'external_evidence'}:
+            if kind in {'context', 'agent_claim', 'file_state', 'permission', 'independent_validation', 'external_evidence', 'http_request'}:
                 import json
                 details = {k: e[k] for k in ('trust', 'role', 'source', 'source_reference', 'phase', 'change', 'size', 'sha256', 'before_sha256',
                     'after_sha256', 'resource_identity', 'resource_version', 'owner_uid', 'mode', 'integrity_predicates',
                     'action', 'scope', 'subject', 'approver', 'request_id', 'expires_at', 'policy_revision',
                     'approval_complete', 'valid_at_candidate_time', 'scope_matches_candidate', 'approval_domain', 'source_integrity', 'passed', 'exit_code', 'validator_sha256',
                     'upstream_run_id', 'upstream_event_id') if k in e}
+                if kind == 'http_request':
+                    details.update({k:e[k] for k in ('method','url','status_code','phase','request_body','response_body','error') if k in e})
+                    if evidence_packet.get('live_window'):
+                        for name in ('request_body','response_body'):
+                            if isinstance(details.get(name),dict):
+                                body = dict(details[name]); excerpt = body.get('excerpt')
+                                body.pop('sha256',None)
+                                if isinstance(excerpt,str):
+                                    body['excerpt'] = redact(excerpt,384)
+                                    body['excerpt_partial'] = len(excerpt)>384 or body.get('truncated',False)
+                                details[name] = body
                 if kind == 'external_evidence' and e.get('goal_at_collection'):
                     details['prior_run_goal'] = redact(e['goal_at_collection'], 384)
                 if enriched:
@@ -226,7 +239,9 @@ def packet(goal: str, finding: dict, observations: list[dict], coverage: list[st
                     'owner_uid', 'owner_gid', 'mode', 'birthtime_ns', 'integrity_predicates', 'diff_excerpt', 'diff_truncated',
                     'action', 'scope', 'subject', 'approver', 'request_id', 'expires_at', 'policy_revision',
                     'approval_complete', 'valid_at_candidate_time', 'scope_matches_candidate', 'approval_domain', 'source_integrity', 'passed', 'exit_code', 'validator_sha256',
-                    'isolation', 'upstream_run_id', 'upstream_event_id', 'upstream_record_sha256', 'origin_kind'):
+                    'isolation', 'upstream_run_id', 'upstream_event_id', 'upstream_record_sha256', 'origin_kind',
+                    'method', 'url', 'scheme', 'http_version', 'status_code', 'headers', 'response_headers',
+                    'request_body', 'response_body', 'client_address', 'error'):
             if key in event: entry[key] = event[key]
         allowed.append({k: v for k, v in entry.items() if v is not None and v != "" and v != []})
     return {

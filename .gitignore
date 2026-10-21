@@ -35,6 +35,8 @@ analysis-events.jsonl
 runtime-status.json
 fixture-receipts.jsonl
 pi-model-audit.jsonl
+http-events.jsonl
+inspection-status.json
 pi-home/
 model-relay/
 pi-evaluation-*/

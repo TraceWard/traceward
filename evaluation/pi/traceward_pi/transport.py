@@ -22,7 +22,7 @@ from traceward.ocsf import JsonlWriter
 
 PI_VERSION = "0.85.1"
 PI_MODEL = "qwen/qwen3.8-27b"
-PI_IMAGE = "traceward-pi:0.85.1-lab2"
+PI_IMAGE = "traceward-pi:0.85.1-lab3"
 MAX_BODY = 8 * 1024 * 1024
 
 

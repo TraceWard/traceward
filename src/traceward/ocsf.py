@@ -16,7 +16,7 @@ from .privacy import redact
 SCHEMA_VERSION = "1.8.0"
 CLASSES = {
     **{kind: (0, "Base Event", 0, "Uncategorized", 99, "Other") for kind in
-       ('context', 'agent_claim', 'file_state', 'permission', 'independent_validation', 'external_evidence', 'assessment')},
+       ('context', 'agent_claim', 'file_state', 'permission', 'independent_validation', 'external_evidence', 'assessment', 'http_request')},
     "hook": (0, "Base Event", 0, "Uncategorized", 99, "Other"),
     "coverage": (0, "Base Event", 0, "Uncategorized", 99, "Other"),
     "process_exit": (1007, "Process Activity", 1, "System Activity", 2, "Terminate"),
@@ -108,7 +108,7 @@ def project(kind: str, item: dict, run_id: str) -> dict:
         )
     else:
         record["message"] = redact(item.get("message", kind), 1000)
-        if kind in {'context', 'agent_claim', 'file_state', 'permission', 'independent_validation', 'external_evidence', 'assessment'}:
+        if kind in {'context', 'agent_claim', 'file_state', 'permission', 'independent_validation', 'external_evidence', 'assessment', 'http_request'}:
             record['unmapped']['traceward']['details'] = {
                 k: v for k, v in item.items() if k not in {'event_id', 'kind', 'time', 'raw_args'} and not k.startswith('_')}
         if kind == "hook":

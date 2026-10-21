@@ -4,6 +4,8 @@
 
 Understand what an agent actually did, how its actions relate to the task you authorised, and which unexpected effects need your attention.
 
+![](./docs/dashboard.png)
+
 ## Why TraceWard is needed
 
 Autonomous agents can run commands, modify files, start processes and communicate with external services. As they work towards a goal, they choose methods that you may not have anticipated.
@@ -67,7 +69,7 @@ flowchart TB
   style Review fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e
 ```
 
-1. **Capture the goal and observations.** The operator supplies the authorised task. Supported integrations provide tool and session signals, while runtime collection and host state checks supply independent evidence. Captured documents and tool output remain lower-trust content; they cannot replace the original goal.
+1. **Capture the goal and observations.** The initial user instruction becomes the run's authorised goal unless the operator supplies a broader goal with `--goal` or `--goal-file`. Supported integrations provide tool and session signals, while runtime collection and host state checks supply independent evidence. Captured documents and tool output remain lower-trust content; they cannot replace the original goal.
 2. **Build the evidence chain.** TraceWard uses process ancestry, tool metadata, resource versions and timing to associate actions with effects. Observed relationships are distinguished from inferred connections, and ambiguous attribution stays explicit.
 3. **Assess consequential behaviour.** A structured model assessment considers goal relevance, authority, integrity, outcome support, benign explanations and missing evidence. Deterministic checks validate selected factual predicates and evidence references. Findings include a rationale and citations to the supporting events.
 4. **Retain and review the result.** Local JSONL records preserve observations and assessment revisions. SQLite provides rebuildable indexes for correlation and the read-only dashboard. You can inspect a finding, follow its source events and review the limits of the capture.
@@ -110,7 +112,6 @@ EXAMPLE_WORKSPACE=$(mktemp -d)
   cd "$EXAMPLE_WORKSPACE"
   "$TRACEWARD_DIR/.venv/bin/python" -m traceward_pi.cli run \
     --workspace "$EXAMPLE_WORKSPACE" \
-    --goal "Create hello.py that prints Hello, world! Do not change other files." \
     --pi-model "$ACTOR_MODEL" --pi-url "$ACTOR_URL" \
     --judge-provider lmstudio \
     --judge-model "$JUDGE_MODEL" --judge-url "$JUDGE_URL" \
@@ -118,7 +119,13 @@ EXAMPLE_WORKSPACE=$(mktemp -d)
 )
 ```
 
+By default, the instruction after `pi --print` is also TraceWard's goal; supply it only once. For a longer session, pass `--goal "Complete the refactor while preserving the public API"` or `--goal-file /path/to/goal.md` before `pi` to give the observer broader scope. Choose one override; it does not replace or prepend the agent's instruction. Goal files are read once at startup, and the selected goal stays fixed for that run. Without an override or a launch prompt, Pi opens its own chat interface. The first chat you submit becomes the frozen observation goal; the dashboard shows that it is waiting until then. With an explicit goal, you can also open Pi with no initial chat.
+
 Pi runs inside the managed Linux runtime. TraceWard automatically prepares the runtime and Pi images on first use; the initial build needs network access and takes longer than cached runs. You do not need to install Pi on the host. Ordinary authorised work should not produce a misalignment finding; its evidence and any assessments remain available for inspection.
+
+The default Pi environment is a network-isolated evaluation lab. For development tools such as `curl` and optional outbound networking, build the [sample Pi development image](examples/pi-dev/README.md) and select it with `--guest-image traceward-pi-dev:local --pi-network bridge` before `pi`. This remains Linux execution inside gVisor, with a fresh Pi home.
+
+Add `--pi-inspect-https` alongside `--pi-network bridge` to inspect HTTP(S) requests from clients using the supplied proxy. TraceWard installs a per-run CA in the guest system trust store and supplies trust settings for Python, curl and Node. Request details and bounded, redacted text bodies appear in the evidence stream. Direct connections, QUIC and custom or pinned certificate stores remain coverage gaps; see [HTTPS inspection](docs/runtime.md#https-inspection-for-pi).
 
 To try the evaluation harness, run a benign repair alongside a compromised-dependency scenario:
 
@@ -140,7 +147,7 @@ In a separate terminal, from the repository root:
 .venv/bin/python -m traceward.cli dashboard
 ```
 
-Open [http://localhost:8765](http://localhost:8765). The dashboard reads captured runs from `~/.local/state/traceward/runs/` by default and can display existing evidence without Docker or a model server running. Keep the terminal open while using it; press `Ctrl+C` to stop the dashboard. Installing `.[dashboard]` above includes both FastAPI and `uvicorn`.
+Open [http://localhost:8765](http://localhost:8765). The dashboard reads captured runs from `~/.local/state/traceward/runs/` by default and can display existing evidence without Docker or a model server running. Below the run metrics, the dashboard shows a live stacked activity chart with counts by event type and adjustable time buckets. Highlighted finding windows link to their findings; the chart and pending analysis update while the agent runs. Live assessments use bounded rolling windows across the supported investigation types; new evidence is assessed while Pi remains open. Model latency still applies; exiting Pi is not required. Keep the terminal open while using it; press `Ctrl+C` to stop the dashboard. Installing `.[dashboard]` above includes both FastAPI and `uvicorn`.
 
 ### Current implementation and limits
 

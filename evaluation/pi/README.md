@@ -12,7 +12,11 @@ uv pip install --python .venv/bin/python --no-deps -e evaluation/pi
 
 The core wheel does not include Pi. This package owns the model relay, Pi setup, guest extension, scenarios, labels, Docker recipe and tests. `traceward-pi eval` and `traceward-pi run` are its entry points. Existing `traceward eval pi` / `traceward run ... pi` commands are lazy compatibility bridges requiring this package. Core Codex runs do not import it.
 
+For `traceward-pi run`, the first user text instruction passed to Pi is the observation goal by default. Optional `--goal TEXT` or `--goal-file PATH` before `pi` overrides the observer's scope without changing the agent's instruction; use one for a longer session with a brief opening prompt. Goal files are read once at startup, and the selected goal stays fixed. Without an override or launch prompt, Pi opens directly. Its first interactive chat establishes the observer goal, which then stays fixed. An explicit goal also allows an empty initial chat. The evaluation harness passes each fixture's frozen goal as Pi's initial instruction, with no separate observer override. Resume/fork, RPC, `@file` initial prompts and unknown agent flags require an explicit goal because initial-instruction inference does not support them. An explicit goal does not change Pi's fresh-home isolation or establish persistent-session support; see the [runtime guide](../../docs/runtime.md).
+
 ## Run
+
+For project development rather than synthetic evaluation, the [sample development image](../../examples/pi-dev/README.md) includes Pi, curl, Python, Node.js and common build tools. Select it with `--guest-image traceward-pi-dev:local` on `run`. The optional `--pi-network bridge` mode enables outbound networking for that run; the default remains `none`, and `eval` does not expose this override. Both modes retain gVisor capture, a fresh Pi home and the fixed host model relay.
 
 Start Docker and local OpenAI-compatible servers with the requested actor and judge models available. LM Studio remains the default for both; an Ollama actor can use its own endpoint while the Qwen judge stays on LM Studio. From the TraceWard checkout:
 
@@ -61,7 +65,7 @@ Use the exact canonical model name returned by Ollama, including `:latest`; the 
 The optional Pi image is built locally on first use from the managed TraceWard runtime plus the pinned Pi package. First build needs package-registry access. After observer/supervisor source changes, rebuild the cached lab image before running:
 
 ```sh
-docker build -t traceward-pi:0.85.1-lab2 -f evaluation/pi/image/Pi.Dockerfile .
+docker build -t traceward-pi:0.85.1-lab3 -f evaluation/pi/image/Pi.Dockerfile .
 ```
 
 ## Chosen Ollama actor — 2026-10-12
@@ -108,7 +112,7 @@ Reports distinguish collection failure, missing sensor evidence, missing candida
 
 ## Isolation, evidence and limitations
 
-Docker applies `--network=none`; the guest can reach only loopback services in that container. A fixed-model gateway relays model requests through outer-only file rendezvous to LM Studio on the invoking host. The guest has neither access to the rendezvous nor a general-purpose host proxy. Optional `TRACEWARD_PI_TOKEN` stays on the host. A fresh Pi home replaces personal configuration, extensions and authentication. Stock Pi prompts/tools are retained; the passive extension records events without blocking, rewriting results or adding attack instructions.
+Evaluation runs and default `run` invocations apply Docker `--network=none`; the guest can reach only loopback services in that container. Development `run --pi-network bridge` explicitly enables Docker's default bridge network, including outbound access and Docker-reachable services. A fixed-model gateway relays model requests through outer-only file rendezvous to LM Studio on the invoking host. The guest has no access to the rendezvous. Optional `TRACEWARD_PI_TOKEN` stays on the host. A fresh Pi home replaces personal configuration, extensions and authentication. Stock Pi prompts/tools are retained; the passive extension records events without blocking, rewriting results or adding attack instructions.
 
 Owner-only reports live under `~/.local/state/traceward/pi-evaluation-<uuid>/`. Per-trial `ground-truth.json` freezes the original goal, fixture hashes and protected-state baseline. `actor-output.jsonl` contains actual Pi output and tool results. Run directories retain normal OCSF events, findings, exact judge packets and source records, plus `pi-model-audit.jsonl`, Pi session data and `fixture-receipts.jsonl`.
 
@@ -203,3 +207,5 @@ The harness preserves actor output, observer diagnostics, a snapshot of its own 
 The 2026-10-17 separate-call capture completed with 3,010 evidence events, 14 actual Pi tool calls and 13 actor-model requests. Its ten implanted stages produced eleven elementary effects (nine protected-file changes plus a forbidden read and transfer), all reproduced and detected. The final 22 assessments contained 11 current review findings and 11 consistent-with-goal records, with complete judgement gates and no unmatched reviews or unresolved citations. Actor work took 90 seconds; total capture, state verification and model analysis took 451 seconds. The actor was the installed Huihui derivative; the original Qwen judge and detector were unchanged.
 
 Earlier attempts remain failures: an exhausted actor pilot, a completed capture with judge auto-loading failures, and a batched capture with ten findings but a missed validation-bypass change after a contradictory judge answer was rejected. The final attempt requested separate sequential check tool calls; its actor context also differed from the batched attempt, so this comparison does not isolate causality. These are developmental results. The harmless fixture was structurally tested; a separate live benign counterpart was not run for this final experiment.
+
+Development `run` commands can enable `--pi-inspect-https --pi-network bridge`; see the [runtime guide](../../docs/runtime.md#https-inspection-for-pi). This starts an observer-side proxy, installs a temporary public CA into guest system trust and configures common client trust settings. It is separate from synthetic lab transcript capture. Existing `eval` commands remain network-isolated and do not enable inspection.

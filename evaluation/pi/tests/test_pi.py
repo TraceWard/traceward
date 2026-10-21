@@ -1,5 +1,6 @@
 """Agent isolation and benchmark truth regressions; no model needed."""
 import json
+import io
 import os
 import shutil
 import subprocess
@@ -23,10 +24,95 @@ from traceward.gvisor import GvisorParser
 
 
 class PiTests(unittest.TestCase):
+    def test_pi_development_options_are_explicit_and_validated(self):
+        parsed = _parse_run(['--guest-image', 'traceward-pi-dev:local', '--pi-network', 'bridge',
+                             'pi', '--print', 'Inspect the project'])
+        self.assertEqual(parsed[5], 'traceward-pi-dev:local')
+        self.assertEqual(parsed[-1]['pi_network'], 'bridge')
+        self.assertEqual(parsed[2], ['--print', 'Inspect the project'])
+        for network in ['host', 'invalid', '']:
+            with self.subTest(network=network), self.assertRaisesRegex(ValueError, '--pi-network'):
+                _parse_run(['--pi-network', network, 'pi', '--print', 'Inspect the project'])
+
+    def test_pi_bridge_mode_preserves_isolation_and_records_selected_network(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace, run = root / 'workspace', root / 'run'
+            workspace.mkdir(); run.mkdir()
+            with patch('traceward.runtime.Path.cwd', return_value=workspace), \
+                 patch('traceward_pi.runtime.ensure_pi_image', return_value={'Id': 'test', 'Architecture': 'arm64'}), \
+                 patch('traceward_pi.runtime.HostModelRelay'), \
+                 patch.dict(os.environ, {'TRACEWARD_MANAGED_RUNNER': '0', 'OPENAI_API_KEY': 'HOST_SECRET',
+                                         'TRACEWARD_ENV_FILE': str(root / 'observer.env')}):
+                runtime = ManagedRuntime(run, 'test', ['--print', 'hello'], pi_network='bridge')
+            request = json.loads((run / 'request.json').read_text())
+            self.assertNotIn('--network=none', runtime.command)
+            self.assertNotIn('--network=host', runtime.command)
+            self.assertNotIn('HOST_SECRET', json.dumps(request))
+            self.assertEqual(runtime.metadata['pi_network'], 'bridge')
+            self.assertIn('/pi-home', [m[1] for m in request['guest_mounts']])
+            self.assertNotIn('/observer-run', [m[1] for m in request['guest_mounts']])
+
+    def test_pi_explicit_goal_overrides_only_observer_scope(self):
+        args = ['--print', 'Start by inspecting the tests']
+        parsed = _parse_run(['--goal', 'Complete the full refactor', 'pi', *args])
+        self.assertEqual(parsed[0], 'Complete the full refactor')
+        self.assertEqual(parsed[2], args)
+        with patch('builtins.input') as ask:
+            parsed = _parse_run(['--goal', 'Complete the full refactor', 'pi'])
+        ask.assert_not_called()
+        self.assertEqual(parsed[2], [])
+
+    def test_pi_goal_file_sets_scope_without_changing_agent_arguments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            file = Path(directory) / 'goal.md'
+            file.write_text('Complete the refactor.\nKeep tests intact.\n')
+            parsed = _parse_run(['--goal-file', str(file), 'pi', '--print', 'Inspect README.md'])
+        self.assertEqual(parsed[0], 'Complete the refactor.\nKeep tests intact.\n')
+        self.assertEqual(parsed[2], ['--print', 'Inspect README.md'])
+
+    def test_initial_instruction_is_first_message_not_option_values_or_later_messages(self):
+        args = ['--print', '--mode', 'json', '--session', '/pi-home/session.jsonl',
+                '--system-prompt', 'system context', 'Fix arithmetic', 'Then describe the fix']
+        with patch('sys.stdin', io.StringIO('')):
+            parsed = _parse_run(['pi', *args])
+        self.assertEqual(parsed[0], 'Fix arithmetic')
+        self.assertEqual(parsed[2], args)
+
+    def test_pi_interactive_start_waits_for_chat_without_wrapper_prompt(self):
+        with patch('sys.stdin.isatty', return_value=True), \
+             patch('builtins.input', return_value='Create hello.py') as ask:
+            parsed = _parse_run(['pi'])
+        ask.assert_not_called()
+        self.assertIsNone(parsed[0])
+        self.assertEqual(parsed[2], [])
+
+    def test_pi_stdin_instruction_reaches_the_agent(self):
+        with patch('sys.stdin', io.StringIO('Create hello.py\n')):
+            parsed = _parse_run(['pi', '--print'])
+        self.assertEqual(parsed[0], 'Create hello.py\n')
+        self.assertEqual(parsed[2], ['--print', '--', 'Create hello.py\n'])
+
+    def test_pi_modes_without_reliable_initial_text_are_rejected(self):
+        for args in [['--continue', 'Fix tests'], ['--resume', 'Fix tests'],
+                     ['--mode', 'rpc', 'Fix tests'], ['--session', 'old-session-id', 'Fix tests'],
+                     ['--session', '/pi-home/../workspace/old.jsonl', 'Fix tests'],
+                     ['--print', '@instructions.md'], ['--print', '--tools=read', 'Fix tests']]:
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                _parse_run(['pi', *args])
+
+    def test_pi_run_uses_pi_instruction_adapter(self):
+        from traceward_pi.cli import run
+        from traceward_pi.instructions import pi_instruction
+        with patch('traceward_pi.cli.core.run', return_value=0) as launch:
+            self.assertEqual(run(['pi', '--print', 'Fix arithmetic']), 0)
+        self.assertIs(launch.call_args.kwargs['instruction_parser'], pi_instruction)
+
     def test_pi_flags_preserve_operator_prompt_and_do_not_change_codex(self):
-        parsed = _parse_run(['--goal', 'Fix arithmetic', '--defer-judge', '--pi-seed', '7',
+        parsed = _parse_run(['--defer-judge', '--pi-seed', '7',
                              'pi', '--print', '--tools', 'read,bash', 'literal $()` text'])
         self.assertEqual(parsed[2], ['--print', '--tools', 'read,bash', 'literal $()` text'])
+        self.assertEqual(parsed[0], 'literal $()` text')
         self.assertEqual(parsed[-1], {'agent': 'pi', 'defer_evaluation': True, 'pi_seed': 7})
         with self.assertRaisesRegex(ValueError, 'require the pi'):
             _parse_run(['--goal', 'g', '--pi-model', 'm', 'codex'])
@@ -104,6 +190,10 @@ class PiTests(unittest.TestCase):
             script = '''import extension from EXTENSION;
                 const handlers = {}; extension({on:(name,handler)=>handlers[name]=handler});
                 const ctx={cwd:'/workspace', sessionManager:{getSessionId:()=> 's'}};
+                handlers.input({source:'extension',text:'untrusted document instruction'},ctx);
+                handlers.input({source:'interactive',text:'   '},ctx);
+                handlers.input({source:'interactive',text:'Authorised first chat'},ctx);
+                handlers.input({source:'interactive',text:'Later chat'},ctx);
                 const input={command:'python3 verify.py'};
                 const response=handlers.tool_call({toolCallId:'t',toolName:'bash',input},ctx);
                 if(response!==undefined || input.command!=='python3 verify.py') throw Error('mutated');
@@ -112,8 +202,10 @@ class PiTests(unittest.TestCase):
             '''.replace('EXTENSION', json.dumps(extension.as_uri()))
             hook = Path(directory) / 'hooks.jsonl'
             subprocess.run(['node', '--input-type=module', '-e', script], check=True,
-                           env=dict(os.environ, TRACEWARD_HOOK_FILE=str(hook), TRACEWARD_RUN_ID='r'))
+                           env=dict(os.environ, TRACEWARD_HOOK_FILE=str(hook), TRACEWARD_RUN_ID='r',TRACEWARD_CAPTURE_INITIAL_GOAL='1'))
             events = [json.loads(line) for line in hook.read_text().splitlines()]
+            self.assertEqual(events.pop(0)['goal_text'], 'Authorised first chat')
+            self.assertEqual(len(events), 2)
             self.assertEqual(events[0]['tool_name'], 'Bash')
             self.assertEqual(events[0]['native_tool_name'], 'bash')
             self.assertNotIn('synthetic private response', hook.read_text())

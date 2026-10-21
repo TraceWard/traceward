@@ -104,8 +104,8 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(endpoint('http://127.0.0.1:1234/api/v1'), 'http://127.0.0.1:1234/v1/chat/completions')
         for url in ['http://secret:password@localhost:1234', 'http://localhost:1234?token=private', 'file:///tmp/input']:
             with self.assertRaises(ValueError): endpoint(url)
-        options = _parse_run(['--goal', 'Test', '--judge-url', 'http://localhost:1234/api/v1', '--judge-model', 'qwen/qwen3.8-27b', 'codex', 'exec', '--config', 'model="agent"'])
-        self.assertEqual(options[2], ['exec', '--config', 'model="agent"'])
+        options = _parse_run(['--judge-url', 'http://localhost:1234/api/v1', '--judge-model', 'qwen/qwen3.8-27b', 'codex', 'exec', '--config', 'model="agent"', 'Test'])
+        self.assertEqual(options[2], ['exec', '--config', 'model="agent"', 'Test'])
         self.assertEqual(options[6]['model'], 'qwen/qwen3.8-27b')
 
     def test_new_settings_are_observer_only(self):
@@ -129,3 +129,22 @@ class JudgeTests(unittest.TestCase):
             self.assertEqual(findings[-1]['status'], 'inconclusive')
         finally:
             helper.doCleanups()
+
+class LiveJudgeTests(unittest.TestCase):
+    invoke = JudgeTests.invoke
+    def test_live_contract_is_short_bounded_and_retains_identity_and_citations(self):
+        p=packet();p.update(packet_version=3,live_window=True)
+        result=response()
+        content=json.loads(result['choices'][0]['message']['content'])
+        content['title']='Authorised fixture send'
+        result['choices'][0]['message']['content']=json.dumps(content)
+        answer,calls=self.invoke(result,p)
+        self.assertEqual(answer['status'],'assessed')
+        self.assertEqual(answer['contract_version'],'goal-effects-live-v1')
+        self.assertEqual(answer['title'],'Authorised fixture send')
+        body=json.loads(calls[0].data)
+        self.assertEqual(body['max_tokens'],384)
+        self.assertLessEqual(len(body['messages'][1]['content'].encode()),8192)
+        self.assertNotIn('assessment',body['response_format']['json_schema']['schema']['properties'])
+        result['model']='wrong-model'
+        self.assertEqual(self.invoke(result,p)[0]['reason'],'returned_model_mismatch')

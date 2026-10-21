@@ -60,10 +60,10 @@ export function RunsView({ runs, loaded }: { runs: Run[]; loaded: boolean }) {
         <label>Sort by<select aria-label="Sort by" value={sort} onChange={e => update(setSort)(e.target.value)}><option value="newest">Newest first</option><option value="oldest">Oldest first</option><option value="name">Name</option><option value="findings">Most findings</option></select></label>
         {filtered && <button className="clear-filters" onClick={() => { setQuery(''); setSource('all'); setStatus('all'); setFindings('all'); setPage(1); }}>Clear filters</button>}
       </div>
-      <div className="table-scroll"><table className="data-table runs-table"><caption className="sr-only">Agent runs</caption><thead><tr><th scope="col">Name / authorised goal</th><th scope="col">Harness</th><th scope="col">Status</th><th scope="col">Findings</th><th scope="col">Events</th><th scope="col">Started</th><th scope="col"><span className="sr-only">Open run</span></th></tr></thead>
+      <div className="table-scroll"><table className="data-table runs-table"><caption className="sr-only">Agent runs</caption><thead><tr><th scope="col">Harness</th><th scope="col">Name / authorised goal</th><th scope="col">Status</th><th scope="col">Findings</th><th scope="col">Events</th><th scope="col">Started</th><th scope="col"><span className="sr-only">Open run</span></th></tr></thead>
         <tbody>{visible.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE).map(run => <tr key={run.run_id} data-run-id={run.run_id} onClick={e => { if (!(e.target as HTMLElement).closest('a')) window.location.hash = runHref(run.run_id); }}>
-          <td className="name-cell"><a href={runHref(run.run_id)} title={runName(run)}>{runName(run)}</a><small><code>{run.run_id.slice(0, 8)}</code>{run.demo_case && <> · {run.demo_case}</>}{run.legacy && ' · Historical'}</small></td>
           <td><span className="harness-tag">{label(harness(run))}</span></td>
+          <td className="name-cell"><a href={runHref(run.run_id)} title={runName(run)}>{runName(run)}</a>{(run.demo_case || run.legacy) && <small>{[run.demo_case, run.legacy && 'Historical'].filter(Boolean).join(' · ')}</small>}</td>
           <td><span className={`status-pill ${run.status}`}><i />{label(run.status)}</span></td>
           <td><span className={run.finding_count ? 'finding-count has-findings' : 'finding-count'}>{run.finding_count}</span></td>
           <td className="numeric">{countEvents(run).toLocaleString()}</td><td className="date-cell"><time dateTime={new Date(run.started_at * 1000).toISOString()}>{timestamp(run.started_at)}</time></td><td aria-hidden="true" className="row-arrow">↗</td>
@@ -104,7 +104,7 @@ export function FindingsView({ runs, findings, loaded }: { runs: Run[]; findings
           const run = runMap.get(finding.run_id); const href = runHref(finding.run_id, finding.finding_id);
           return <tr key={`${finding.run_id}/${finding.finding_id}`} data-finding-id={finding.finding_id} onClick={e => { if (!(e.target as HTMLElement).closest('a')) window.location.hash = href; }}>
             <td className="name-cell"><a href={href}>{finding.title}</a><small className="review-label">Review required · revision {finding.revision}</small></td>
-            <td className="finding-run-cell"><a href={href} title={run ? runName(run) : finding.run_id}>{run ? runName(run) : finding.run_id}</a><small><code>{finding.run_id.slice(0, 8)}</code></small></td>
+            <td className="finding-run-cell"><a href={href} title={run ? runName(run) : 'Run unavailable'}>{run ? runName(run) : 'Run unavailable'}</a></td>
             <td>{label(run ? harness(run) : 'unknown')}</td><td className="effects-cell">{finding.observed_effects.map(label).join(', ') || '—'}</td><td className="date-cell">{timestamp(finding.time)}</td><td aria-hidden="true" className="row-arrow">↗</td>
           </tr>;
         })}</tbody></table></div>

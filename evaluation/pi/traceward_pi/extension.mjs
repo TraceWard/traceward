@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 
 export default function (pi) {
   let turn = 0;
+  let initialInstruction = false;
   const clean = value => String(value ?? '').replace(/\b(?:sk-[A-Za-z0-9_-]{10,}|Bearer\s+\S+)/g, '[REDACTED]')
     .replace(/\b([A-Z_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|ACCESS_KEY|CREDENTIAL)[A-Z_]*\s*[=:]\s*)([^\s,;]+)/gi, '$1[REDACTED]').slice(0, 4096);
   const excerpt = value => clean(value)
@@ -25,6 +26,12 @@ export default function (pi) {
     } catch { /* Observation must not change the tool outcome. */ }
   };
   pi.on('session_start', (_, ctx) => emit('SessionStart', ctx));
+  pi.on('input', (event, ctx) => {
+    if (process.env.TRACEWARD_CAPTURE_INITIAL_GOAL !== '1' || initialInstruction ||
+        event.source !== 'interactive' || !event.text?.trim()) return;
+    initialInstruction = true;
+    emit('InitialInstruction', ctx, {input_source: 'interactive', goal_text: clean(event.text)});
+  });
   pi.on('turn_start', event => { turn = event.turnIndex; });
   pi.on('tool_call', (event, ctx) => {
     targets.set(event.toolCallId, String(event.input.path ?? event.input.command ?? ''));

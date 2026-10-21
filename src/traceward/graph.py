@@ -43,7 +43,9 @@ class EvidenceGraph:
             'excerpt_truncated', 'content_sha256', 'source_reference', 'action', 'scope', 'subject', 'approver',
             'request_id', 'expires_at', 'policy_revision', 'approval_complete', 'approval_domain', 'source_integrity',
             'passed', 'exit_code', 'validator_sha256', 'isolation', 'upstream_run_id', 'upstream_event_id',
-            'upstream_record_sha256', 'origin_kind', 'path_resolution', 'origin_event_id', 'goal_at_collection'}
+            'upstream_record_sha256', 'origin_kind', 'path_resolution', 'origin_event_id', 'goal_at_collection',
+            'method', 'url', 'scheme', 'http_version', 'status_code', 'headers', 'response_headers',
+            'request_body', 'response_body', 'client_address', 'error'}
         exported = {k: v for k, v in item.items() if k in allowed}
         from .privacy import redact
         def scrub(value):

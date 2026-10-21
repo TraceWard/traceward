@@ -276,6 +276,14 @@ class RunIndex:
     def findings(self, run_id: str) -> list[dict]:
         return [f for f in self.assessments(run_id) if f.get('status') == 'review_required']
 
+    def activity(self, run_id: str, interval_seconds: int | None = None) -> dict:
+        from .activity import histogram
+        with self.lock:
+            row = self.db.execute('SELECT manifest,summary FROM runs WHERE run_id=?', (_run_id(run_id),)).fetchone()
+            manifest = json.loads(row['manifest']) if row and row['manifest'] else {}
+            summary = json.loads(row['summary']) if row and row['summary'] else None
+            return histogram(self.db, run_id, manifest, summary, self.findings(run_id), interval_seconds)
+
     def all_findings(self) -> list[dict]:
         """Latest review findings across runs, excluding withdrawals and audit records."""
         with self.lock:
@@ -411,6 +419,12 @@ def create_app(index: RunIndex, assets: Path | None = None):
         index.refresh()
         required_run(run_id)
         return {"findings": index.findings(run_id)}
+
+    @app.get('/api/runs/{run_id}/activity')
+    def activity(run_id: str, interval: int | None = Query(default=None, ge=1, le=86400)):
+        index.refresh()
+        required_run(run_id)
+        return index.activity(run_id, interval)
 
     @app.get("/api/runs/{run_id}/processes")
     def processes(run_id: str):

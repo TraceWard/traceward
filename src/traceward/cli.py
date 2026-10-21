@@ -17,6 +17,7 @@ from .ocsf import EvidenceStore
 from .privacy import redact
 from .gvisor import GvisorParser
 from .runtime import ManagedRuntime
+from .instructions import codex_instruction
 
 
 def state_root() -> Path:
@@ -26,7 +27,7 @@ def state_root() -> Path:
 
 def _usage() -> str:
     return (
-        "usage: traceward run [--goal TEXT | --goal-file PATH] [--context-mode metadata|redacted] [--validation-script PATH] [--permissions-file PATH] [--shared-root PATH] [--judge-provider lmstudio|laya] [--judge-url URL] [--judge-model MODEL] [--runner-image IMAGE] [--workspace PATH] [--guest-image IMAGE] [--defer-judge] codex [AGENT FLAGS...]\n"
+        "usage: traceward run [--goal TEXT | --goal-file PATH] [--context-mode metadata|redacted] [--validation-script PATH] [--permissions-file PATH] [--shared-root PATH] [--judge-provider lmstudio|laya] [--judge-url URL] [--judge-model MODEL] [--runner-image IMAGE] [--workspace PATH] [--guest-image IMAGE] [--defer-judge] codex [AGENT FLAGS...] [INITIAL INSTRUCTION]\n"
         "       traceward eval pi [--cases CASE...] [--trials N] [--actor-model MODEL] [--actor-url URL]\n"
         "       traceward watch RUN_ID\n"
         "       traceward dashboard [--runs-dir PATH] [--port PORT]\n"
@@ -35,7 +36,7 @@ def _usage() -> str:
     )
 
 
-def _parse_run(args: list[str]) -> tuple:
+def _parse_run(args: list[str], *, instruction_parser=codex_instruction) -> tuple:
     goal = goal_file = laya_url = image = workspace = guest_image = None
     judge_options = {}
     agent_options = {}
@@ -49,9 +50,9 @@ def _parse_run(args: list[str]) -> tuple:
         if flag not in {"--goal", "--goal-file", "--laya-url", "--runner-image", "--workspace", "--guest-image", "--judge-provider", "--judge-url", "--judge-model", '--context-mode', '--validation-script', '--permissions-file', '--shared-root'} or index + 1 >= len(args):
             raise ValueError(_usage())
         value = args[index + 1]
-        if flag == "--goal":
+        if flag == '--goal':
             goal = value
-        elif flag == "--goal-file":
+        elif flag == '--goal-file':
             goal_file = value
         elif flag == "--laya-url":
             laya_url = value
@@ -73,22 +74,23 @@ def _parse_run(args: list[str]) -> tuple:
     agent_options['agent'] = args[index]
     if agent_options.get('context_mode', 'metadata') not in {'metadata', 'redacted'}:
         raise ValueError('--context-mode must be metadata or redacted')
-    if goal and goal_file:
-        raise ValueError("choose --goal or --goal-file, not both")
     if laya_url and judge_options:
         raise ValueError('choose --laya-url or --judge-* options')
     if judge_options.get('provider', 'lmstudio') not in {'lmstudio', 'laya'}:
         raise ValueError('judge provider must be lmstudio or laya')
-    if goal_file:
-        goal = Path(goal_file).read_text(encoding="utf-8").strip()
-    if not goal:
-        if sys.stdin.isatty():
-            goal = input("Authorised goal for this run: ").strip()
-        else:
-            raise ValueError("a non-interactive run requires --goal or --goal-file")
-    if not goal:
-        raise ValueError("goal cannot be empty")
-    return goal, laya_url, args[index + 1:], image, workspace, guest_image, judge_options, agent_options
+    if goal is not None and goal_file is not None:
+        raise ValueError('choose --goal or --goal-file, not both')
+    agent_args = args[index + 1:]
+    if goal_file is not None:
+        goal = Path(goal_file).expanduser().read_text(encoding='utf-8')
+    if goal is not None:
+        if not goal.strip():
+            raise ValueError('goal cannot be empty')
+        # Explicit operator scope does not depend on recovering a launch prompt.
+        # Preserve stdin and all agent arguments, including interactive starts.
+    else:
+        goal, agent_args = instruction_parser(agent_args)
+    return goal, laya_url, agent_args, image, workspace, guest_image, judge_options, agent_options
 
 
 def _tail_lines(path: Path, offset: int, pending: str) -> tuple[list[str], int, str]:
@@ -111,9 +113,10 @@ def _safe_run_dir(run_id: str) -> Path:
     return state_root() / str(parsed)
 
 
-def _write_manifest(path: Path, run_id: str, goal: str, started_at: float, agent: str = 'codex') -> None:
+def _write_manifest(path: Path, run_id: str, goal: str | None, started_at: float, agent: str = 'codex') -> None:
     """Atomically publish liveness without exposing an agent prompt or login data."""
-    item = {"run_id": run_id, "goal": redact(goal, 1000), "started_at": started_at,
+    item = {"run_id": run_id, "goal": redact(goal, 1000) if goal is not None else 'Waiting for first user instruction',
+            'goal_status': 'awaiting_instruction' if goal is None else 'established', "started_at": started_at,
             "heartbeat_at": time.time(),
             "source": "scripted_agent" if os.environ.get("TRACEWARD_DEMO_CASE") else agent,
             "demo_case": os.environ.get('TRACEWARD_EVALUATION_CASE') or os.environ.get("TRACEWARD_REAL_CASE") or os.environ.get("TRACEWARD_DEMO_CASE"),
@@ -131,9 +134,14 @@ def _write_manifest(path: Path, run_id: str, goal: str, started_at: float, agent
         temporary.unlink(missing_ok=True)
 
 
-def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_name='codex') -> int:
-    goal, laya_url, codex_args, image, workspace, guest_image, judge_options, agent_options = _parse_run(args)
+def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_name='codex',
+        instruction_parser=codex_instruction) -> int:
+    goal, laya_url, codex_args, image, workspace, guest_image, judge_options, agent_options = _parse_run(
+        args, instruction_parser=instruction_parser)
     defer_evaluation = agent_options.pop('defer_evaluation', False)
+    pending_goal = goal is None
+    if pending_goal:
+        runtime_options = {**(runtime_options or {}), 'capture_initial_goal': True}
     context_mode = agent_options.pop('context_mode', 'metadata')
     validator = agent_options.pop('validation_script', None)
     permission_file = agent_options.pop('permissions_file', None)
@@ -155,7 +163,7 @@ def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_na
                                  workspace=workspace, guest_image=guest_image, context_mode=context_mode, **(runtime_options or {}))
     except Exception:
         path = run_dir / "summary.json"
-        path.write_text(json.dumps({"run_id": run_id, "goal": redact(goal, 1000),
+        path.write_text(json.dumps({"run_id": run_id, "goal": redact(goal or '', 1000),
                                     "codex_exit_code": None, "finding_count": 0,
                                     "coverage_gaps": ["runtime setup failed; no agent task started"]}))
         path.chmod(0o600)
@@ -187,9 +195,9 @@ def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_na
         frozen_validator = run_dir / 'independent-check.py'
         vfd = os.open(frozen_validator, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(vfd, 'wb') as stream: stream.write(data)
-    engine = Engine(goal, store, alert_fn=alert, coverage_gaps=[],
+    engine = Engine(goal or '', store, alert_fn=alert, coverage_gaps=[],
                     workspace=runtime.metadata["workspace"],
-                    defer_evaluation=defer_evaluation,
+                    defer_evaluation=defer_evaluation or pending_goal,
                     extended_analysis=True, context_mode=context_mode,
                     graph_path=state_root().parent / 'evidence-graph.sqlite', shared_roots=shared_roots,
                     transport_endpoints=runtime.transport_endpoints,
@@ -211,6 +219,7 @@ def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_na
     started = last_heartbeat = time.monotonic()
     trace_pos = hook_pos = 0
     trace_pending = hook_pending = ""
+    http_pos, http_pending = 0, ''
     warned_hooks = False
     child = None
     def forward(signum, _frame):
@@ -218,13 +227,19 @@ def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_na
             runtime.signal(child, signum)
     previous = {s: signal.signal(s, forward) for s in (signal.SIGTERM, signal.SIGINT)}
     def drain():
-        nonlocal trace_pos, hook_pos, trace_pending, hook_pending
+        nonlocal trace_pos, hook_pos, trace_pending, hook_pending, goal, pending_goal, http_pos, http_pending
         trace_lines, trace_pos, trace_pending = _tail_lines(trace_file, trace_pos, trace_pending)
         hook_lines, hook_pos, hook_pending = _tail_lines(hook_file, hook_pos, hook_pending)
         for line in hook_lines:
             try:
                 item = json.loads(line)
                 if item.get("run_id") == run_id:
+                    if pending_goal and item.get('event') == 'InitialInstruction' and item.get('input_source') == 'interactive':
+                        text = item.get('goal_text')
+                        if isinstance(text, str) and text.strip():
+                            goal, pending_goal = text, False
+                            engine.set_goal(text, defer_evaluation=defer_evaluation)
+                            _write_manifest(run_dir / 'run.json', run_id, goal, started_at, agent)
                     engine.hook(item)
             except (ValueError, TypeError):
                 engine.add_gap("malformed hook record")
@@ -232,6 +247,19 @@ def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_na
             effect = parser.parse(line)
             if effect:
                 engine.effect(effect)
+        http_lines, http_pos, http_pending = _tail_lines(run_dir/'http-events.jsonl', http_pos, http_pending)
+        for line in http_lines:
+            try:
+                item = json.loads(line)
+                if item.get('kind') == 'http_request': engine.observe(item)
+            except (ValueError, TypeError):
+                engine.add_gap('malformed HTTP inspection record')
+        inspection = run_dir/'inspection-status.json'
+        if inspection.exists():
+            try:
+                status = json.loads(inspection.read_text())
+                if status.get('healthy') is False: engine.add_gap('HTTPS inspection proxy failed; HTTP visibility is incomplete')
+            except (ValueError, OSError): engine.add_gap('HTTPS inspection health unavailable')
         for gap in parser.gaps:
             engine.add_gap(gap)
     try:
@@ -329,7 +357,7 @@ def watch(run_id: str) -> int:
 def _agent_argument(args):
     index = 0
     while index < len(args) and args[index].startswith('--'):
-        index += 1 if args[index] == '--defer-judge' else 2
+        index += 1 if args[index] in {'--defer-judge', '--pi-inspect-https'} else 2
     return args[index] if index < len(args) else None
 
 

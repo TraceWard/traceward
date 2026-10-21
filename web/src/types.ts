@@ -78,11 +78,14 @@ export type Finding = {
   uncalibrated_risk_score: number | null;
   assessment_note?: string;
   is_alert?: boolean;
+  analysis_window?: {duration_seconds: number; stride_seconds: number; agent_finished: boolean};
   assessment?: Record<string, {status: string; summary: string; evidence_ids: string[]}>;
   verified_claims?: {fact_type: string; evidence_ids: string[]}[];
   laya?: {
     status: string;
     reason?: string;
+    validation_error?: string;
+    contract_version?: string;
     model?: string;
     semantic_accuracy_validated?: boolean;
     dimensions?: Record<string, number>;

@@ -44,15 +44,16 @@ def endpoint(value):
 def generative_judge(packet, *, url=None, model=None, timeout=60):
     selected_model = model or os.environ.get('TRACEWARD_JUDGE_MODEL', DEFAULT_MODEL)
     selected_url = endpoint(url or os.environ.get('TRACEWARD_JUDGE_URL', DEFAULT_URL))
-    enriched = packet.get('packet_version', 2) >= 3
+    live = bool(packet.get('live_window'))
+    enriched = packet.get('packet_version', 2) >= 3 and not live
     rendered = model_input(packet, max_state_bytes=12288 if enriched else 8192)
     visible_aliases = {a:eid for a,eid in rendered.get('evidence_aliases',{}).items()
                        if eid in rendered.get('represented_evidence_ids',[])}
     facts = factual_predicates(packet.get('evidence',[]),visible_aliases,packet.get('consequential_evidence_ids',[])) if enriched else None
-    body = request_payload(rendered.get('state', ''), selected_model, enriched=enriched, facts=facts,evidence_aliases=visible_aliases)
+    body = request_payload(rendered.get('state', ''), selected_model, enriched=enriched, facts=facts,evidence_aliases=visible_aliases, live=live)
     encoded = json.dumps(body).encode()
     started = time.monotonic()
-    provenance = {'provider': 'lmstudio', 'contract_version': 'goal-effects-v4' if enriched else 'goal-effects-v3',
+    provenance = {'provider': 'lmstudio', 'contract_version': 'goal-effects-live-v1' if live else 'goal-effects-v4' if enriched else 'goal-effects-v3',
         'endpoint': selected_url, 'requested_model': selected_model, 'model': selected_model,
         'request_sha256': hashlib.sha256(encoded).hexdigest(), 'request': body,
         'model_input': rendered, 'question_contract': body['response_format'],
@@ -83,7 +84,7 @@ def generative_judge(packet, *, url=None, model=None, timeout=60):
     try:
         if result['model'] != selected_model:
             return unavailable('returned_model_mismatch', returned_model=redact(str(result.get('model')), 128))
-        answer = validate_response(result, visible_aliases, enriched=enriched, evidence=packet.get('evidence', []),facts=facts)
+        answer = validate_response(result, visible_aliases, enriched=enriched, evidence=packet.get('evidence', []),facts=facts, live=live)
         required = set(packet.get('consequential_evidence_ids', []))
         cited = [visible_aliases[a] for a in answer['evidence_ids']]
         if required and not required.intersection(cited):
@@ -91,10 +92,11 @@ def generative_judge(packet, *, url=None, model=None, timeout=60):
         if enriched:
             claims = [visible_aliases[a] for fid in answer['claims'] for a in facts[fid]['evidence_ids']]
             if not required.intersection(claims): return unavailable('no_typed_claim_cites_consequential_evidence')
-    except (KeyError, IndexError, TypeError, ValueError):
-        return unavailable('invalid_structured_answer')
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        return unavailable('invalid_structured_answer', validation_error=redact(str(exc), 256))
     return {'status': 'assessed', **provenance, 'returned_model': result['model'],
         'answer': sanitized(answer),
+        **({'title': redact(answer['title'],160)} if live else {}),
         **({'title': redact(answer['title'], 160), 'assessment': {name: {**sanitized(facet),
             'evidence_ids': [visible_aliases[a] for a in facet['evidence_ids']]}
             for name, facet in answer['assessment'].items()},

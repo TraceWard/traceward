@@ -281,6 +281,8 @@ def supervise(request_path: Path, *, services_factory=None) -> int:
                 raise RuntimeError("gVisor required tracing session did not initialize")
             loss_reported = False
             while child.poll() is None:
+                for service in services:
+                    if hasattr(service, 'check_health'): service.check_health()
                 if receiver.disconnected_at and time.monotonic() - receiver.disconnected_at > 0.5 and not loss_reported:
                     receiver.gap("collector connection closed while the guest was running; coverage incomplete")
                     loss_reported = True

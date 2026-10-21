@@ -12,9 +12,10 @@ from traceward.runtime import ManagedRuntime, codex_home, hook_overrides, worksp
 
 class RuntimeTests(unittest.TestCase):
     def test_codex_flags_are_forwarded_verbatim_after_agent_name(self):
-        options = _parse_run(['--goal','Fix tests','--runner-image','runner:v1','--workspace','/workspace',
+        options = _parse_run(['--runner-image','runner:v1','--workspace','/workspace',
                               'codex','exec','--config','model="example"','two words'])
         self.assertEqual(options[2], ['exec','--config','model="example"','two words'])
+        self.assertEqual(options[0], 'two words')
         self.assertEqual(options[3:5], ('runner:v1','/workspace'))
         self.assertIn('/opt/traceward-hooks', ' '.join(hook_overrides()))
 

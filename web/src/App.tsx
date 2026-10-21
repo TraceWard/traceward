@@ -2,6 +2,7 @@ import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } fr
 
 import type { Run, Event, Finding, Raw } from "./types";
 import { RunsView, FindingsView, readRoute } from "./views";
+import ActivityChart from './ActivityChart';
 
 const short = (value: string, size = 8) => value?.slice(0, size) || "—";
 const date = (value?: number, millis = false) =>
@@ -25,6 +26,7 @@ const kind = (event: Event) => {
 const eventTitle = (event: Event) => {
   const meta = event.unmapped?.traceward;
   const detail = meta?.details;
+  if (kind(event) === 'http_request') return `${String(detail?.method || 'HTTP')} ${String(detail?.url || 'request')}${detail?.status_code ? ` · ${detail.status_code}` : ''}`;
   if (kind(event) === 'file_state') return `${String(detail?.change || detail?.phase || 'Observed state')} · ${String(detail?.path || 'repository file')}`;
   if (kind(event) === 'context' || kind(event) === 'agent_claim') return `${String(detail?.role || 'Captured context')} · ${String(detail?.source_reference || detail?.source || '')}`;
   if (kind(event) === 'permission') return `${String(detail?.action || 'Permission evidence')} · ${String(detail?.scope || 'scope unknown')}`;
@@ -217,6 +219,7 @@ export default function App() {
   const [older, setOlder] = useState<number | null>(null);
   const [evaluations, setEvaluations] = useState<{finding_id: string; revision: number; packet: unknown; judgement: unknown}[]>([]);
   const [loadedRun, setLoadedRun] = useState("");
+  const [pendingAssessments, setPendingAssessments] = useState(0);
   const activeRun = useRef(runId);
   const paginationStarted = useRef(false);
   const eventInspector = useRef<HTMLElement | null>(null);
@@ -240,13 +243,14 @@ export default function App() {
   const loadRun = useCallback(async () => {
     if (!runId) return;
     try {
-      const [eventData, findingData, processData, evaluationData] = await Promise.all([
+      const [eventData, findingData, processData, evaluationData, assessmentData] = await Promise.all([
         get<{ events: Event[]; next_before: number | null }>(
           `/api/runs/${runId}/events?limit=250`,
         ),
         get<{ findings?: Finding[]; assessments?: Finding[] }>(`/api/runs/${runId}/${assessmentAudit ? 'assessments' : 'findings'}`),
         get<{ processes: Event[] }>(`/api/runs/${runId}/processes`),
         get<{ evaluations: typeof evaluations }>(`/api/runs/${runId}/evaluations`),
+        get<{ assessments: Finding[] }>(`/api/runs/${runId}/assessments`),
       ]);
       if (activeRun.current !== runId) return;
       setEvents(current => {
@@ -258,6 +262,7 @@ export default function App() {
       const visible = findingData.assessments ?? findingData.findings ?? [];
       setFindings(visible);
       setEvaluations(evaluationData.evaluations);
+      setPendingAssessments(assessmentData.assessments.filter(a => a.status === 'provisional').length);
       setLoadedRun(runId);
       setSelectedFinding((current) =>
         current && visible.some((f) => f.finding_id === current)
@@ -436,7 +441,7 @@ export default function App() {
         <header className="topbar">
           <div className="breadcrumb">
             <a href={route.page === "findings" ? "#findings" : "#runs"}>{route.page === "findings" ? "Findings" : "Agent Runs"}</a>
-            {runId && <><span>/</span><b>Investigation</b><span>/</span><code>{short(runId)}</code></>}
+            {runId && <><span>/</span><b>Investigation</b></>}
           </div>
           <span className="local-label">Local workspace</span>
         </header>
@@ -453,7 +458,7 @@ export default function App() {
             <div className="content-header">
               <div>
                 <div className="eyebrow">
-                  RUN / {short(run.run_id, 12)}{" "}
+                  RUN{" "}
                   <span className={`status-label ${run.status}`}>
                     {run.status}
                   </span>
@@ -464,10 +469,6 @@ export default function App() {
                   recorded events
                 </p>
               </div>
-              <div className="header-meta">
-                <span>Run ID</span>
-                <code>{run.run_id}</code>
-              </div>
             </div>
             <section className="goal-card">
               <div className="goal-icon">◎</div>
@@ -477,6 +478,7 @@ export default function App() {
                 <small>{run.source} {run.demo_case && `· ${run.demo_case}`} · {run.evaluation_label}{run.legacy && " · historical results were not revalidated"}</small>
               </div>
             </section>
+            {pendingAssessments > 0 && <p className="analysis-status" role="status">Assessing {pendingAssessments} observed {pendingAssessments === 1 ? 'effect' : 'effects'}… Findings appear as review completes; the agent can keep running.</p>}
             <div className="metrics">
               <div className="metric">
                 <span>EVENTS OBSERVED</span>
@@ -502,6 +504,10 @@ export default function App() {
                 <small>{run.assessment_count ?? run.finding_count} internal assessments</small>
               </div>
             </div>
+            <ActivityChart key={runId} runId={runId} live={run.status === 'live'} onFinding={id => {
+              setSelectedFinding(id); setAssessmentAudit(false);
+              window.location.hash = `runs/${runId}?finding=${id}&view=findings`;
+            }} />
             <div className="investigation-tabs" role="tablist" aria-label="Run investigation" onKeyDown={event => {
               if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
               event.preventDefault();
@@ -572,6 +578,7 @@ export default function App() {
                     <option value="file_read">File reads</option>
                     <option value="file_write">File writes</option>
                     <option value="network_send">Network sends</option>
+                    <option value="http_request">HTTP requests</option>
                     <option value="finding">Findings</option>
                     <option value="coverage">Coverage</option>
                   </select>
@@ -721,6 +728,7 @@ export default function App() {
                               </small>
                             </div>
                             {finding.assessment_note && <p className="assessment-note">{finding.assessment_note}</p>}
+                            {finding.analysis_window && <p className="window-status">Rolling {finding.analysis_window.duration_seconds}-second observation window with relevant earlier causal evidence. {finding.analysis_window.agent_finished ? 'Final session context.' : 'Assessed while the session was running; new evidence feeds later windows.'}</p>}
                             <div className="section-label">
                               DECISION MODEL · {finding.laya?.status === "unavailable"
                                 ? "UNAVAILABLE"
@@ -730,7 +738,7 @@ export default function App() {
                               <div className="score-card structured-assessment">
                                 <div className="score-top">
                                   <div><span>MODEL VERDICT</span><strong>{finding.laya.disposition?.replaceAll("_", " ")}</strong></div>
-                                  <span className="score-tag">{finding.laya.model?.includes("demo") ? "SIMULATED EVALUATOR" : "STRUCTURED MODEL REVIEW"}</span>
+                                  <span className="score-tag">{finding.laya.model?.includes("demo") ? "SIMULATED EVALUATOR" : finding.laya.contract_version === 'goal-effects-live-v1' ? 'STRUCTURED LIVE REVIEW' : "STRUCTURED MODEL REVIEW"}</span>
                                 </div>
                                 <p className="judge-rationale">{finding.laya.rationale}</p>
                                 {finding.assessment && <div className="assessment-facets">
@@ -790,7 +798,7 @@ export default function App() {
                             ) : (
                               <div className="model-unavailable">
                                 {finding.laya
-                                  ? `Judgement unavailable (${finding.laya.reason || "no score"}).`
+                                  ? `Judgement unavailable (${finding.laya.reason || "no score"}${finding.laya.validation_error ? `: ${finding.laya.validation_error}` : ''}).`
                                   : "Provisional finding. Waiting for the decision model…"}{" "}
                                 The observed evidence remains available.
                               </div>

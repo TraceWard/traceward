@@ -10,7 +10,11 @@ from .transport import start_guest_gateway
 
 
 def services(request, output):
-    servers = [start_guest_gateway(output)]
+    servers = []
+    if request.get('inspect_https'):
+        from .inspection import Inspection
+        servers.append(Inspection(request, output))
+    servers.append(start_guest_gateway(output))
     if request.get('fixture_receiver'):
         from http.server import BaseHTTPRequestHandler, HTTPServer
         import hashlib

@@ -331,7 +331,7 @@ def main(argv=None) -> int:
               'seed': args.seed, 'max_calls': args.max_calls, 'results': [],
               'source_sha256': {**{'harness/'+p.name: digest(p) for p in Path(__file__).parent.iterdir() if p.suffix in {'.py','.mjs'}},
                   **{'core/'+name: digest(Path(traceward.__file__).parent / name) for name in
-                      ('cli.py','runtime.py','runner.py','engine.py','judges.py','structured.py','context.py','state.py','graph.py','laya.py')}},
+                      ('cli.py','instructions.py','runtime.py','runner.py','engine.py','judges.py','structured.py','context.py','state.py','graph.py','laya.py')}},
               'context_mode': args.context_mode,
               'actor_sampling': {'temperature': 0.6, 'seed': args.seed, 'reasoning_effort': 'none', 'max_tokens': 1600},
               'limitations': ['Development fixtures, not independent holdout or production accuracy.',
@@ -351,7 +351,7 @@ def main(argv=None) -> int:
             private_json(trial_dir / 'ground-truth.json', spec)
             validator = trial_dir/'independent-validator.py'
             validator.write_text(spec.get('validator_source', MATH_CHECK));validator.chmod(0o600)
-            command = [sys.executable, '-m', 'traceward.cli', 'run', '--goal', spec['goal'],
+            command = [sys.executable, '-m', 'traceward.cli', 'run',
                        '--context-mode', args.context_mode, '--validation-script', str(validator),
                        '--defer-judge', '--pi-model', args.actor_model, '--pi-url', args.actor_url,
                        '--pi-seed', str(spec['seed']), '--pi-max-calls', str(args.max_calls),

@@ -35,6 +35,43 @@ for i in range(30):
   (extra/'summary.json').write_text(json.dumps({'codex_exit_code': 0}))
 index = RunIndex(runs,root/'index.sqlite')
 app = create_app(index,Path(__file__).resolve().parents[2]/'src/traceward/dashboard_assets')
+@app.post('/test/live/{phase}')
+def live(phase: str):
+ live_id='33333333-3333-4333-8333-333333333333'
+ live_folder=runs/live_id
+ live_folder.mkdir(mode=0o700,exist_ok=True)
+ manifest=live_folder/'run.json'
+ initial=json.loads(manifest.read_text()).get('started_at',time.time()) if manifest.exists() else time.time()
+ manifest.write_text(json.dumps({'goal':'Do not make network requests',
+   'started_at':initial,'heartbeat_at':time.time(),'source':'pi','observer_version':'gvisor-v1'}))
+ live_store=EvidenceStore(live_folder,live_id)
+ if phase=='pending':
+  observed=time.time()
+  live_store.event('http_request',{'event_id':'live-http','time':time.time(),
+    'source':'tls_inspection_proxy','method':'POST','url':'https://example.com/upload',
+    'phase':'response','status_code':200,'response_body':{'excerpt':'synthetic response'}})
+  live_store.event('file_read',{'event_id':'live-read','time':observed,'pid':1,'path':'/workspace/sample','bytes':5})
+ observed=next(json.loads(line)['time']/1000 for line in (live_folder/'events.jsonl').read_text().splitlines() if json.loads(line)['metadata']['uid']=='live-http')
+ if phase=='activity':
+  live_store.event('file_write',{'event_id':'live-write','time':observed+10,'pid':1,'path':'/workspace/sample','bytes':5})
+  return {'ok':True,'summary_exists':False}
+ if phase=='long':
+  live_store.event('process',{'event_id':'live-later','time':observed+86400*3,'pid':1,'name':'worker'})
+  return {'ok':True,'summary_exists':False}
+ if phase=='separate-review':
+  live_store.event('file_read',{'event_id':'live-later-read','time':observed+60,'pid':1,'path':'/workspace/sample','bytes':5})
+  live_store.finding({**base,'finding_id':'later-review','revision':1,'time':observed+61,
+    'title':'Separate later finding','status':'review_required','evidence_ids':['live-later-read'],
+    'analysis_window':{'start':observed+59,'end':observed+62}})
+  return {'ok':True,'summary_exists':False}
+ live_store.finding({**base,'finding_id':'live-review','revision':2 if phase=='review' else 1,
+   'time':time.time(),'title':'Unexpected POST to example.com',
+   'status':'review_required' if phase=='review' else 'provisional',
+   **({'analysis_window':{'start':observed-5,'end':observed+10,'duration_seconds':30,'stride_seconds':1,'agent_finished':False},
+       'laya':{'status':'assessed','contract_version':'goal-effects-live-v1','model':'synthetic-live-regression',
+               'disposition':'review_required','rationale':'Synthetic prohibited request.','cited_evidence_ids':['live-http']}} if phase=='review' else {}),
+   'observed_effects':['http_request'],'evidence_ids':['live-http']})
+ return {'ok':True,'summary_exists':(live_folder/'summary.json').exists()}
 @app.post('/test/revision/{mode}')
 def revision(mode:str):
  if mode=='selectors':

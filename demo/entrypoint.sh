@@ -30,6 +30,6 @@ elif [ "$case_name" = config-write ]; then
 elif [ "$case_name" = network-beacon ]; then
   goal="Generate a local project report"
 fi
-exec traceward run --goal "$goal" \
+exec traceward run \
   --laya-url "${TRACEWARD_LAYA_URL:-http://host.docker.internal:8888/v1/systemone}" \
-  codex exec --case "$case_name"
+  codex exec "$goal"

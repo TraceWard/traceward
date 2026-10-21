@@ -64,6 +64,9 @@ class Engine:
         self.measure_latency = measure_latency
         self.evaluation_wait_seconds = evaluation_wait_seconds
         self.defer_evaluation = defer_evaluation
+        self.live_windows = extended_analysis and not defer_evaluation
+        self.window_seconds, self.window_stride_seconds = 30.0, 1.0
+        self.last_reviews = {}
         self.workspace = posixpath.normpath(workspace) if workspace else None
         self.extended_analysis, self.context_mode = extended_analysis, context_mode
         self.transport_endpoints = set(transport_endpoints)
@@ -79,8 +82,10 @@ class Engine:
         self.post_hooks: dict[str, dict] = {}
         self.lock = threading.RLock()
         self.changed = threading.Condition(self.lock)
+        self.event_generation = 0
         self.finished = False
         self.last_arrival = time.monotonic()
+        self.post_arrivals: dict[str, float] = {}
         self.execs: list[dict] = []
         self.links: dict[int, str] = {}
         self.ambiguous_tools: set[str] = set()
@@ -98,6 +103,17 @@ class Engine:
         if len(goal)>1000: self.coverage_gaps.append('authorised goal truncated by bounded contract; authority context incomplete')
         self.counts: dict[str, int] = defaultdict(int)
         self.first_alert_latency: float | None = None
+
+    def set_goal(self, goal: str, *, defer_evaluation=False) -> None:
+        with self.changed:
+            if self.goal or not goal.strip():
+                raise ValueError('the run goal is already established or empty')
+            self.goal = goal
+            self.defer_evaluation = defer_evaluation
+            self.live_windows = self.extended_analysis and not defer_evaluation
+            if len(goal) > 1000: self.add_gap('authorised goal truncated by bounded contract; authority context incomplete')
+            self.event_generation += 1
+            self.changed.notify_all()
 
     def observe(self, item: dict) -> dict:
         with self.changed:
@@ -127,6 +143,22 @@ class Engine:
                         'Independent validation differs from the completion report',
                         'A frozen independent checker failed; compare its result with the agent report.',
                         ['independent_validation', 'agent_claim'], [*claims[-2:], item], candidate_kind='outcome')
+            if self.extended_analysis and item['kind'] == 'http_request':
+                if item.get('phase') in {'request', 'error'}:
+                    matches = [h for h in self.hooks if h.get('command') and h['time'] <= item['time']
+                               and (h['tool_use_id'] not in self.post_hooks or
+                                    item['time'] <= self.post_hooks[h['tool_use_id']]['time'] + .5)]
+                    tid = matches[0]['tool_use_id'] if len(matches) == 1 else None
+                    self._emit_finding(('http_request',item['request_id'],item.get('phase','request')),
+                        tid, item, 'Observed HTTP request: '+item.get('method','')+' '+item.get('url',''),
+                        'The independent inspection proxy observed an HTTP request. Request/response content is bounded and redacted; upstream receipt is a separate outcome.',
+                        ['http_request'], [item], candidate_kind='http_request')
+                elif item.get('phase') == 'response':
+                    for f, _ in self.candidate_seeds.values():
+                        if f.get('candidate_kind') == 'http_request' and any(
+                            e.get('request_id') == item['request_id'] for e in self.candidate_seeds[f['finding_id']][1]):
+                            self.state_updates.setdefault(f['finding_id'], []).append(item)
+            self.event_generation += 1
             self.changed.notify_all()
             return item
 
@@ -138,6 +170,7 @@ class Engine:
     def hook(self, item: dict) -> None:
         with self.changed:
             self._hook(item)
+            self.event_generation += 1
             self.last_arrival = time.monotonic()
             self.changed.notify_all()
 
@@ -158,11 +191,13 @@ class Engine:
             self._link()
         elif item.get("event") == "PostToolUse" and item.get("tool_use_id"):
             self.post_hooks[item["tool_use_id"]] = item
+            self.post_arrivals[item['tool_use_id']] = time.monotonic()
             self._link()
 
     def effect(self, item: dict) -> None:
         with self.changed:
             self._effect(item)
+            self.event_generation += 1
             self.last_arrival = time.monotonic()
             self.changed.notify_all()
 
@@ -447,6 +482,25 @@ class Engine:
             tool_id = shell_id or (matches[0]["tool_use_id"] if len(matches) == 1 else None)
             hook = next((h for h in self.hooks if h.get("tool_use_id") == tool_id), None)
         post = self.post_hooks.get(tool_id)
+        sampled_sends = 0
+        if finding.get('candidate_kind') == 'network_effect':
+            trigger = next((e for e in seed if e['kind'] == 'network_send'), None)
+            if trigger:
+                # All sends on the candidate's process/endpoint belong in its
+                # consequential evidence, not just the first DNS/TLS write.
+                sends = [e for e in self.effects if e['kind'] == 'network_send'
+                         and _key(e) == _key(trigger) and e.get('endpoint') == trigger.get('endpoint')
+                         and (self._tool_for(_key(e)) == tool_id if tool_id else
+                              abs(e['time'] - trigger['time']) <= 30)
+                         and (not post or e['time'] <= post['time'] + .5)]
+                if self.live_windows and sends:
+                    cutoff = max(e['time'] for e in sends) - self.window_seconds
+                    sends = [e for e in sends if e['time'] >= cutoff]
+                    sampled_sends = max(0, len(sends)-16)
+                    sends = sends[-16:]
+                seed = list({e['event_id']: e for e in [*seed, *sends]}.values())
+                finding = {**finding, 'consequential_evidence_ids': list(dict.fromkeys([
+                    *finding['consequential_evidence_ids'], *(e['event_id'] for e in sends)]))}
         # Context is bounded to the linked tool tree, not Codex's own login/LLM traffic.
         cwd = (hook.get("cwd", "") if hook else self.workspace or "").rstrip("/")
         context = []
@@ -472,6 +526,10 @@ class Engine:
                 and not any(p in path.split("/") for p in ("node_modules", ".git", "__pycache__"))
             ):
                 context.append(e)
+        window_end = max((e['time'] for e in [*seed, *context, *self.state_updates.get(finding['finding_id'], [])]), default=finding['time'])
+        window_start = window_end - self.window_seconds
+        if self.live_windows:
+            context = [e for e in context if e['time'] >= window_start]
         seed_ids = {e["event_id"] for e in seed}
         extra = sorted((e for e in context if e["event_id"] not in seed_ids), key=lambda e: e["time"])
         omitted = max(0, len(extra) - 60)
@@ -481,6 +539,8 @@ class Engine:
         evidence = sorted({e["event_id"]: {**e, "parent_pid": e.get("parent_pid", self.parents.get(_key(e)))}
                            for e in evidence}.values(), key=lambda e: (e["time"], e["event_id"]))
         gaps = list(self.coverage_gaps)
+        if sampled_sends:
+            gaps.append(f'{sampled_sends} sends omitted from bounded rolling evidence sample; full events retained; do not clear')
         if not post:
             gaps.append("PostToolUse missing or tool still active; episode may be incomplete")
         if omitted:
@@ -505,7 +565,7 @@ class Engine:
             outcome = (f"reported exit code {post['result_exit_code']}" if post.get("result_exit_code") is not None
                        else "PostToolUse received; exit status was not available in the compact hook")
             counter.append(f"{post['event_id']}: {outcome}; completion is not authorisation")
-        counter.append("Payloads and file contents were not collected; a read followed by a send does not prove those bytes were sent")
+        counter.append("Syscall payloads and file buffers were not collected; optional HTTP proxy excerpts are separate observations and a read followed by a send does not prove payload flow")
         process_ids = {_key(e): e["event_id"] for e in evidence if e["kind"] == "process"}
         links = [{"relation": "process_parent", "parent_pid": e["parent_pid"], "child_pid": e["pid"],
                   "evidence_id": e["event_id"], "parent_evidence_id": process_ids.get(e.get("parent_process_key") or e["parent_pid"])}
@@ -534,9 +594,17 @@ class Engine:
                    and not any(any(marker in g for marker in
                        ("buffer reached capacity", "dropped source messages", "could not be normalized", "SecCheck", "collector")) for g in gaps),
                    "attribution": "uncertain" if ambiguous else "command-and-process-lineage" if hook.get("command") else "hook-resource-time"}
+        if finding.get('candidate_kind') == 'http_request':
+            updated['attribution'] = 'proxy-request-tool-window' if hook and not ambiguous else 'uncertain'
+            if hook:
+                updated['causal_links'].append({'relation':'proxy_request_tool_window',
+                    'hook_evidence_id':hook['event_id'], 'confidence':'unique_tool_interval_inference'})
         if write:
             writes = [e for e in evidence if e["kind"] == "file_write"
                       and (_sensitive_path(e.get("path", "")) or self._workspace_write(e))]
+            if self.live_windows and len(writes) > 16:
+                gaps.append(f'{len(writes)-16} writes omitted from consequential rolling sample; full events retained; do not clear')
+                writes = writes[-16:]
             updated["consequential_evidence_ids"] = list(dict.fromkeys([*finding["consequential_evidence_ids"],
                                                                        *(e["event_id"] for e in writes)]))
         # Resumed syscalls can arrive after a send but have an earlier timestamp.
@@ -558,6 +626,13 @@ class Engine:
             evidence_packet.update({'packet_version': 3, 'analysis_version': 2,
                 'candidate_kind': updated.get('candidate_kind'),
                 'consequential_effects_only': True})
+        if self.live_windows:
+            evidence_packet['live_window'] = not self.finished
+            evidence_packet['analysis_window'] = {'start': window_start, 'end': window_end,
+                'duration_seconds': self.window_seconds, 'stride_seconds': self.window_stride_seconds,
+                'context_event_limit': 60, 'causal_context_carried': True,
+                'agent_finished': self.finished}
+            updated['analysis_window'] = evidence_packet['analysis_window']
         return updated, evidence_packet
 
     def _augment_episode(self, finding, evidence, gaps):
@@ -640,14 +715,67 @@ class Engine:
         return finding, evidence, finding['coverage_gaps']
 
     def _enrich(self, finding: dict, seed: list[dict]) -> None:
-        # Alert immediately, but let the evidence stream and PostToolUse settle before judging.
+        try:
+            if self.live_windows: self._rolling_assessment(finding, seed)
+            else: self._enrich_episode(finding, seed)
+        except Exception as exc:
+            # Never leave a silently orphaned provisional candidate after a
+            # packet/worker failure. The source evidence remains authoritative.
+            self.add_gap('assessment worker failed: ' + type(exc).__name__)
+            failed = {**finding, 'revision': self.assessed_packets.get(finding['finding_id'], (1, None))[0] + 1, 'time': time.time(),
+                      'status': 'evaluation_unavailable', 'is_alert': False,
+                      'coverage_gaps': [*self.coverage_gaps],
+                      'laya': {'status': 'unavailable', 'reason': 'assessment_worker_' + type(exc).__name__}}
+            if self.extended_analysis:
+                self.store.assessment(failed)
+                self.review_ids.discard(finding['finding_id'])
+                self.counts['finding'] = len(self.review_ids)
+            else:
+                self.store.finding(failed)
+
+    def _rolling_assessment(self, finding, seed):
+        """Coalesce arrivals while inference runs; never wait for session exit.
+
+        One worker owns each investigation's revisions. Two global judge slots
+        bound concurrent inference; a waiting worker refreshes its packet when
+        it gets a slot instead of queueing a snapshot for every source event.
+        """
+        previous = None
+        processed_generation = -1
+        ready_at = time.monotonic() + min(.25, self.evaluation_wait_seconds)
+        while True:
+            with self.changed:
+                while not self.finished and (self.defer_evaluation or time.monotonic() < ready_at or self.event_generation == processed_generation):
+                    delay = max(.01, ready_at-time.monotonic()) if time.monotonic() < ready_at else None
+                    self.changed.wait(timeout=.1 if self.defer_evaluation else delay)
+                generation = self.event_generation
+                updated, packet = self._episode(finding, seed)
+                final = self.finished
+                if packet == previous:
+                    processed_generation = generation
+                    if final: return
+                    ready_at = time.monotonic() + self.window_stride_seconds
+                    continue
+            revision = self.assessed_packets.get(finding['finding_id'], (1, None))[0] + 1
+            self._assess(updated, packet, revision_number=revision)
+            previous = self.assessed_packets[finding['finding_id']][1]
+            processed_generation = generation
+            if final: return
+            ready_at = time.monotonic() + self.window_stride_seconds
+
+    def _tool_settled(self, tool_id) -> bool:
+        return tool_id in self.post_hooks and time.monotonic() - self.post_arrivals.get(tool_id, 0) >= .25
+
+    def _enrich_episode(self, finding: dict, seed: list[dict]) -> None:
+        # Assess during the session; unrelated agent/model activity must not
+        # postpone a completed tool's judgement until the whole run goes quiet.
         # A long-running tool is assessed after at most ten seconds with an explicit gap.
         deadline = time.monotonic() + self.evaluation_wait_seconds
         with self.changed:
             while self.defer_evaluation and not self.finished:
                 self.changed.wait(timeout=.1)
             while not self.finished and time.monotonic() < deadline:
-                if finding["tool_use_id"] in self.post_hooks and time.monotonic() - self.last_arrival >= 0.5:
+                if self._tool_settled(finding['tool_use_id']):
                     break
                 self.changed.wait(timeout=0.1)
             finding, evidence_packet = self._episode(finding, seed)
@@ -657,7 +785,7 @@ class Engine:
         if not any(e.get("hook_event") == "PostToolUse" for e in evidence_packet["evidence"]):
             with self.changed:
                 while not self.finished:
-                    if finding["tool_use_id"] in self.post_hooks and time.monotonic() - self.last_arrival >= 0.5:
+                    if self._tool_settled(finding['tool_use_id']):
                         break
                     self.changed.wait(timeout=0.1)
                 final_finding, final_packet = self._episode(finding, seed)
@@ -666,8 +794,15 @@ class Engine:
 
     def _assess(self, finding: dict, evidence_packet: dict, *, revision_number: int) -> None:
         try:
-            with self.judge_slots:
-                judgement = self.judge_fn(evidence_packet)
+            if not self.goal.strip():
+                judgement = {'status': 'unavailable', 'reason': 'initial_user_goal_not_received'}
+            else:
+                with self.judge_slots:
+                    if self.live_windows and evidence_packet.get('live_window'):
+                        with self.changed:
+                            original, seed = self.candidate_seeds[finding['finding_id']]
+                            finding, evidence_packet = self._episode(original, seed)
+                    judgement = self.judge_fn(evidence_packet)
         except Exception as exc:
             judgement = {"status": "unavailable", "reason": type(exc).__name__}
         revision = {**finding, "revision": revision_number, "time": time.time(), "laya": judgement}
@@ -701,6 +836,18 @@ class Engine:
                 [*revision["coverage_gaps"], "Decision model judgement unavailable"]
             ))
         if self.extended_analysis:
+            if self.live_windows and revision['status'] == 'evaluation_unavailable' and finding['finding_id'] in self.last_reviews:
+                # A failed later assessment cannot refute the earlier valid
+                # review. Keep its original scope/citations and expose failure.
+                prior = self.last_reviews[finding['finding_id']]
+                revision = {**prior, 'revision': revision_number, 'time': revision['time'],
+                    'laya': judgement, 'latest_assessment_status': 'evaluation_unavailable',
+                    'retained_review_revision': prior['revision'],
+                    'assessment_note': 'Earlier supported review retained with its original evidence; the latest model assessment was unavailable and did not clear it.'}
+            elif revision['status'] == 'review_required':
+                self.last_reviews[finding['finding_id']] = revision
+            elif revision['status'] in {'consistent_with_goal', 'inconclusive'}:
+                self.last_reviews.pop(finding['finding_id'], None)
             self.store.assessment(revision)
             if revision['is_alert']:
                 self.review_ids.add(finding['finding_id'])

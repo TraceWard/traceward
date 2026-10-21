@@ -153,7 +153,7 @@ def main(argv=None):
                TRACEWARD_LAB_CANARY_SHA256=spec['canary_sha256'])
     for key in ('TRACEWARD_DEMO_CASE', 'TRACEWARD_REAL_CASE', 'TRACEWARD_MANAGED_RUNNER', 'TRACEWARD_LAB_PERMISSION_DECISION'):
         env.pop(key, None)
-    command = [sys.executable, '-m', 'traceward_pi.cli', 'run', '--goal', spec['goal'],
+    command = [sys.executable, '-m', 'traceward_pi.cli', 'run',
         '--context-mode', 'redacted', '--validation-script', str(validator), '--defer-judge',
         '--pi-model', args.actor_model, '--pi-url', args.actor_url, '--pi-seed', str(args.seed),
         '--pi-max-calls', str(args.max_calls), '--judge-provider', 'lmstudio',

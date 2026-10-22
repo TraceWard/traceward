@@ -204,12 +204,50 @@ class PiTests(unittest.TestCase):
             subprocess.run(['node', '--input-type=module', '-e', script], check=True,
                            env=dict(os.environ, TRACEWARD_HOOK_FILE=str(hook), TRACEWARD_RUN_ID='r',TRACEWARD_CAPTURE_INITIAL_GOAL='1'))
             events = [json.loads(line) for line in hook.read_text().splitlines()]
-            self.assertEqual(events.pop(0)['goal_text'], 'Authorised first chat')
+            self.assertEqual(next(e for e in events if e['event'] == 'InitialInstruction')['goal_text'], 'Authorised first chat')
+            self.assertEqual(sum(e['event'] == 'InitialInstruction' for e in events), 1)
+            self.assertEqual(sum(e['event'] == 'Input' for e in events), 4)
+            events = [e for e in events if e['event'] in {'PreToolUse', 'PostToolUse'}]
             self.assertEqual(len(events), 2)
             self.assertEqual(events[0]['tool_name'], 'Bash')
             self.assertEqual(events[0]['native_tool_name'], 'bash')
             self.assertNotIn('synthetic private response', hook.read_text())
             self.assertEqual(events[1]['result_status'], 'ok')
+
+    @unittest.skipUnless(shutil.which('node'), 'Node needed for passive extension test')
+    def test_all_extension_events_preserve_inputs_and_omit_payloads(self):
+        extension = Path(__file__).resolve().parents[1] / 'traceward_pi/extension.mjs'
+        with tempfile.TemporaryDirectory() as directory:
+            script = '''import extension, {PI_HOOK_EVENTS} from EXTENSION;
+                const handlers = {}; extension({on:(name,handler)=>handlers[name]=handler});
+                if(Object.keys(handlers).length!==36) throw Error('incomplete hook registration');
+                const ctx={cwd:'/workspace',sessionManager:{getSessionId:()=> 's'}};
+                for(const name of Object.keys(PI_HOOK_EVENTS)) {
+                  const event={type:name,reason:'startup',turnIndex:7,status:200,
+                    toolCallId:'t',toolName:'write',input:{path:'app.py'},args:{path:'app.py'},
+                    message:{role:'assistant',content:[{type:'text',text:'PRIVATE MESSAGE'}]},
+                    assistantMessageEvent:{type:'text_delta',delta:'PRIVATE DELTA'},
+                    headers:{Authorization:'PRIVATE HEADER'},payload:{secret:'PRIVATE PAYLOAD'},
+                    text:'PRIVATE INPUT',prompt:'PRIVATE PROMPT',systemPrompt:'PRIVATE SYSTEM',
+                    result:{content:[{type:'text',text:'PRIVATE RESULT'}]},
+                    partialResult:{text:'PRIVATE PARTIAL'}};
+                  const before=JSON.stringify(event);
+                  const result=handlers[name](event,name==='project_trust'?{cwd:'/workspace'}:ctx);
+                  if(JSON.stringify(event)!==before) throw Error('input mutated: '+name);
+                  if(name==='project_trust' ? result?.trusted!=='undecided' : result!==undefined)
+                    throw Error('observer decision: '+name);
+                }
+            '''.replace('EXTENSION', json.dumps(extension.as_uri()))
+            hook = Path(directory) / 'hooks.jsonl'
+            subprocess.run(['node', '--input-type=module', '-e', script], check=True,
+                env=dict(os.environ, TRACEWARD_HOOK_FILE=str(hook), TRACEWARD_CONTEXT_MODE='metadata',
+                         TRACEWARD_CAPTURE_INITIAL_GOAL='0'))
+            events = [json.loads(line) for line in hook.read_text().splitlines()]
+            self.assertEqual(len(events), 36)
+            self.assertEqual(len({e['native_event'] for e in events}), 36)
+            self.assertNotIn('PRIVATE', hook.read_text())
+            self.assertEqual(next(e for e in events if e['event'] == 'TurnStart')['turn_id'], '7')
+            self.assertEqual(next(e for e in events if e['event'] == 'AfterProviderResponse')['hook_metadata']['status'], 200)
 
     def test_judge_is_deferred_until_actor_finishes(self):
         with tempfile.TemporaryDirectory() as directory:

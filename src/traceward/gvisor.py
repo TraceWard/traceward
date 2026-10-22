@@ -20,7 +20,7 @@ MAX_PACKET = 1024 * 1024
 CONTEXT = ["time", "thread_id", "task_start_time", "group_id", "thread_group_start_time",
            "container_id", "cwd", "process_name", "parent_thread_group_id"]
 POINTS = {
-    "sentry/clone": [], "sentry/execve": [], "sentry/exit_notify_parent": [],
+    "sentry/file_delete": [], "sentry/clone": [], "sentry/execve": [], "sentry/exit_notify_parent": [],
     **{f"syscall/{name}/exit": ["fd_path"] for name in
        ("open", "openat", "creat", "close", "read", "readv", "pread64", "preadv",
         "write", "writev", "pwrite64", "pwritev", "connect", "dup", "dup2", "dup3", "fcntl")},
@@ -29,7 +29,7 @@ POINTS = {
 TYPES = {1: container.Start, 2: sentry.CloneInfo, 3: sentry.ExecveInfo, 4: sentry.ExitNotifyParentInfo, 5: sentry.TaskExit,
          6: syscall.Syscall, 7: syscall.Open, 8: syscall.Close, 9: syscall.Read,
          10: syscall.Connect, 12: syscall.Socket, 18: syscall.Fcntl, 19: syscall.Dup,
-         34: syscall.Write}
+         34: syscall.Write, 39: syscall.FileDelete}
 
 
 def trace_config(endpoint: str, abi: str) -> dict:
@@ -154,6 +154,19 @@ class GvisorParser:
         common.update({"syscall_number": int(d.get("sysno", 0)), "result": result,
                        "errno": error, "operation_status": "failed" if error or result < 0 else "succeeded"})
         fd = int(d.get("fd", -1))
+        if kind == 39:
+            pathname, base = d.get('pathname', ''), d.get('start_path', '')
+            resolved = bool(pathname and (pathname.startswith('/') or base.startswith('/')))
+            path = os.path.normpath(os.path.join(base, pathname)) if resolved else ''
+            if not resolved:
+                self.gaps.add('deletion target path unresolved; deletion evidence retained')
+            return {**common, 'kind': 'file_delete', 'path': path,
+                    'pathname': pathname, 'start_path': base, 'dirfd': int(d.get('dirfd', -100)),
+                    'flags': int(d.get('flags', 0)), 'directory': bool(d.get('directory', False)),
+                    'path_error': d.get('path_error', ''),
+                    'syscall': {87: 'unlink', 84: 'rmdir', 263: 'unlinkat'}.get(common['syscall_number'], 'unlinkat')
+                        if self.abi == 'amd64' else 'unlinkat',
+                    'path_resolution': 'kernel-consumed pathname and captured start; lexical, intermediate symlinks possible' if resolved else 'unresolved'}
         if kind == 7:
             path = d.get("pathname", "")
             base = c.get("cwd") or self.cwd

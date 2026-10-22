@@ -1,6 +1,6 @@
 # Optional simulator demonstration, using exactly the managed runtime.
 # This image deliberately replaces guest Codex with a labelled stand-in.
-FROM ghcr.io/traceward/runner:0.2.0
+FROM ghcr.io/traceward/runner:0.2.0-delete1
 COPY . /opt/traceward/project
 RUN pip install --no-cache-dir -e /opt/traceward/project \
  && rm /opt/traceward/rootfs/usr/local/bin/codex \

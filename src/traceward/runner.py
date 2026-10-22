@@ -18,6 +18,7 @@ from google.protobuf.message import DecodeError
 from ._gvisor.common_pb2 import Handshake
 from .gvisor import MAX_PACKET, RELEASE, decode_packet, trace_config
 from .ocsf import JsonlWriter
+from .collector_status import write_status
 
 
 class Receiver:
@@ -175,6 +176,9 @@ def supervise(request_path: Path, *, services_factory=None) -> int:
         Path("/custom-rootfs").mkdir(mode=0o700, exist_ok=True)
         # This is a Docker export of an explicitly selected, trusted image.
         subprocess.run(["tar", "-xf", "/custom-rootfs.tar", "-C", "/custom-rootfs"], check=True)
+    metadata = subprocess.run(['runsc', 'trace', 'metadata'], capture_output=True, text=True, check=True, timeout=10).stdout
+    if 'sentry/file_delete' not in metadata:
+        raise RuntimeError('incompatible runtime: required sentry/file_delete capability missing; rebuild the TraceWard runner')
     rootfs = Path(request.get("rootfs", "/opt/traceward/rootfs"))
     if not (rootfs / "usr/local/bin/python3").exists():
         raise RuntimeError("guest image requires /usr/local/bin/python3 for trusted hooks")
@@ -253,12 +257,28 @@ def supervise(request_path: Path, *, services_factory=None) -> int:
         # gVisor can log an init-session error and still start the sandbox.
         # Only the trusted bootstrap runs until the session is verified.
         child = subprocess.Popen(command)
+        cleanup_started, signal_forwarded = False, False
+        established = False
         def forward(signum, _frame):
+            nonlocal signal_forwarded
+            if cleanup_started or signal_forwarded: return
+            signal_forwarded = True
             subprocess.run([*base, "kill", "--all", sandbox, str(signum)],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         previous = {s: signal.signal(s, forward) for s in (signal.SIGTERM, signal.SIGINT)}
+        status_failure_reported = False
+        def persist_status(*, established, finalized):
+            nonlocal status_failure_reported
+            try:
+                write_status(output, receiver, abi=abi, established=established, finalized=finalized)
+            except OSError:
+                # Losing observer status must not change the guest's outcome.
+                if not status_failure_reported:
+                    receiver.gap("collector status persistence failed; final counters unavailable")
+                    status_failure_reported = True
         proxy = None
         try:
+            persist_status(established=False, finalized=False)
             if console:
                 from .terminal import ConsoleProxy
                 proxy = ConsoleProxy(console)
@@ -271,6 +291,7 @@ def supervise(request_path: Path, *, services_factory=None) -> int:
                 if (sessions.returncode == 0 and '"Default"' in sessions.stdout and "remote" in sessions.stdout
                         and receiver.handshakes and receiver.worker.is_alive() and not receiver.persistence_failed):
                     established = True
+                    persist_status(established=True, finalized=False)
                     (launch / "ready").touch()
                     break
                 time.sleep(0.05)
@@ -280,6 +301,7 @@ def supervise(request_path: Path, *, services_factory=None) -> int:
                 child.wait()
                 raise RuntimeError("gVisor required tracing session did not initialize")
             loss_reported = False
+            last_status = time.monotonic()
             while child.poll() is None:
                 for service in services:
                     if hasattr(service, 'check_health'): service.check_health()
@@ -289,47 +311,37 @@ def supervise(request_path: Path, *, services_factory=None) -> int:
                 if (receiver.persistence_failed or not receiver.worker.is_alive()) and not loss_reported:
                     receiver.gap("collector persistence failed while the guest was running; coverage incomplete")
                     loss_reported = True
+                if time.monotonic() - last_status >= 1:
+                    persist_status(established=established, finalized=False)
+                    last_status = time.monotonic()
                 time.sleep(0.05)
             code = child.wait()
         finally:
-            if proxy:
-                proxy.close()
-            if console:
-                console.close()
-            for s, handler in previous.items():
-                signal.signal(s, handler)
-            subprocess.run([*base, "delete", "--force", sandbox],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            for mount in [tmp / "state" / "null-netns"]:
-                subprocess.run(["umount", "-l", str(mount)],
+            cleanup_started = True
+            try:
+                if proxy:
+                    proxy.close()
+                if console:
+                    console.close()
+                subprocess.run([*base, "delete", "--force", sandbox],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            receiver.close()
-            if fixture_server:
-                fixture_server.shutdown()
-                fixture_server.server_close()
-            for service in services:
-                service.shutdown()
-                service.server_close()
-            if not receiver.handshakes or not receiver.messages:
-                receiver.gap("required gVisor telemetry was not established")
-            versions = Path("/opt/traceward/versions.json")
-            resources = {}
-            for name in ("cpu.stat", "memory.peak"):
+                for mount in [tmp / "state" / "null-netns"]:
+                    subprocess.run(["umount", "-l", str(mount)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                receiver.close()
+                if fixture_server:
+                    fixture_server.shutdown()
+                    fixture_server.server_close()
+                for service in services:
+                    service.shutdown()
+                    service.server_close()
+                if not receiver.handshakes or not receiver.messages:
+                    receiver.gap("required gVisor telemetry was not established")
+            finally:
                 try:
-                    resources[name] = Path("/sys/fs/cgroup", name).read_text().strip()
-                except OSError:
-                    pass
-            status = {"outer_container_resources": resources, "runtime": "gvisor", "gvisor_release": RELEASE, "abi": abi,
-                      "versions": json.loads(versions.read_text()) if versions.exists() else {},
-                      "handshakes": receiver.handshakes, "source_messages": receiver.messages,
-                      "dropped_messages": receiver.dropped, "decode_errors": receiver.errors, "collector_dropped_messages": receiver.queue_losses,
-                      "collector_failed": receiver.persistence_failed,
-                      "final_loss_counter": "last received header; trailing loss after final message is unknown"}
-            status_path = output / "runtime-status.json"
-            status_path.write_text(json.dumps(status))
-            owner = output.stat()
-            os.chown(status_path, owner.st_uid, owner.st_gid)
-            status_path.chmod(0o600)
+                    persist_status(established=established, finalized=not receiver.worker.is_alive())
+                finally:
+                    for sig, handler in previous.items(): signal.signal(sig, handler)
         return code if code >= 0 else 128 - code
 
 

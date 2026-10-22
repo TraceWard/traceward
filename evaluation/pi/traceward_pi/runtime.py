@@ -10,12 +10,13 @@ import traceward
 from traceward.runtime import AgentSpec, ManagedRuntime, RUNNER_IMAGE, checked, ensure_image
 from .transport import PI_IMAGE, PI_MODEL, PI_VERSION, HostModelRelay, model_config, private_json
 
-INSPECTION_IMAGE = 'traceward-pi:0.85.1-inspect1'
+INSPECTION_IMAGE = 'traceward-pi:0.85.1-inspect2'
 
 
 def _source_signature():
     files = [*Path(traceward.__file__).parent.glob('*.py'), *Path(__file__).parent.glob('*.py'),
-             *Path(__file__).parent.glob('*.mjs')]
+             *Path(__file__).parent.glob('*.mjs'),
+             Path(traceward.__file__).parent / 'runner_image/gvisor/provenance.json']
     return hashlib.sha256(b''.join(p.name.encode() + p.read_bytes() for p in sorted(files))).hexdigest()
 
 

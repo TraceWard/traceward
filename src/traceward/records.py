@@ -21,3 +21,29 @@ def assessment_record(record: dict) -> dict:
         return record
     key, judgement = candidates[0]
     return {**{k: v for k, v in record.items() if k != key}, 'judge': judgement}
+
+
+def effective_assessment(record: dict, revisions: list[dict]) -> dict:
+    """Read-only presentation of a verdict retained across a failed later attempt."""
+    current = assessment_record(record)
+    judge = current.get('judge', {})
+    state = ('cancelled' if judge.get('reason') == 'assessment_cancelled_on_shutdown' else
+             'pending' if judge.get('status') == 'pending' else
+             'assessed' if judge.get('status') in {'assessed', 'scored'} else
+             'unavailable' if judge else 'pending')
+    effective, revision, error = (judge, current.get('revision'), None) if state == 'assessed' else (None, None, None)
+    retained = current.get('retained_review_revision')
+    if retained is not None and effective is None:
+        prior = next((assessment_record(r) for r in revisions
+                      if r.get('finding_id') == current.get('finding_id') and r.get('revision') == retained), None)
+        if (prior and prior.get('status') == 'review_required'
+                and prior.get('judge', {}).get('status') in {'assessed', 'scored'}
+                and set(prior.get('evidence_ids', [])) == set(current.get('evidence_ids', []))
+                and set(prior.get('consequential_evidence_ids', [])) == set(current.get('consequential_evidence_ids', []))
+                and prior.get('analysis_window') == current.get('analysis_window')
+                and prior.get('tool_use_id') == current.get('tool_use_id')):
+            effective, revision = prior['judge'], retained
+        else:
+            error = 'Retained assessment missing or its evidence scope does not match'
+    return {**current, 'effective_judge': effective, 'effective_judge_revision': revision,
+            'assessment_attempt_status': state, 'effective_judge_error': error}

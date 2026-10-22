@@ -8,5 +8,17 @@
     "container.proto": "6ca8103090f76706df54abf64e6d11d3a6fef150be9da21749adffe7a6e35d29",
     "sentry.proto": "bb7fb301e0ded3939be5074c798f36ccf118758206b5747e26daddef5fbaecdf",
     "syscall.proto": "18d6540f4e04a4d8e7f24e17e24ad4b407b16f50f33188f872ce8881ff1a7ec7"
+  },
+  "traceward_patch": {
+    "upstream_release": "release-20260928.0",
+    "upstream_commit": "6485c3fbdfe28172ced5d6aed49554cf494967db",
+    "source_url": "https://codeload.github.com/google/gvisor/tar.gz/6485c3fbdfe28172ced5d6aed49554cf494967db",
+    "source_sha256": "894316888a4b8e9d0b82441bf464eaa04e89b76d327bb2b2fc23f0480a7f8b03",
+    "patch_sha256": "67dddfd92a8de5e44aca53aa6a00ae54bdc676326dc0f1345c398ce421847759",
+    "capability": "sentry/file_delete-v1"
+  },
+  "patched_files": {
+    "common.proto": "99d717e65aa81698c070e668ecc17b7a5984159a1becfb7d3309051c3ec3a52a",
+    "syscall.proto": "c1220c122098c1c84b3b91252337e4c4ee90b00f7e26d60d2416f025c9f28bee"
   }
 }

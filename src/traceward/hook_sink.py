@@ -41,6 +41,15 @@ def compact_hook(payload: dict) -> dict:
         "result_status": redact(response_meta["status"], 32) if isinstance(response_meta.get("status"), str) else None,
         "result_exit_code": response_meta.get("exit_code") if isinstance(response_meta.get("exit_code"), int) else None,
     }
+    # Explicit metadata allowlist: lifecycle hooks can carry prompts, transcripts
+    # and other content which must not become implicit payload capture.
+    metadata = {}
+    for key in ("source", "reason", "trigger", "agent_id", "agent_type", "permission_mode"):
+        if isinstance(payload.get(key), str):
+            metadata[key] = redact(payload[key], 256)
+    if isinstance(payload.get("stop_hook_active"), bool):
+        metadata["stop_hook_active"] = payload["stop_hook_active"]
+    item["hook_metadata"] = metadata
     if os.environ.get('TRACEWARD_CONTEXT_MODE') == 'redacted' and response is not None:
         item['response_excerpt'] = content_redact(text_content(response))
     return item
@@ -50,6 +59,7 @@ def main() -> int:
     target = os.environ.get("TRACEWARD_HOOK_FILE")
     if not target:
         return 0
+    payload = {}
     try:
         payload = json.load(sys.stdin)
         item = compact_hook(payload)
@@ -62,7 +72,11 @@ def main() -> int:
             os.close(fd)
     except (OSError, ValueError, TypeError):
         # Observability must not change Codex's permission or execution outcome.
-        return 0
+        pass
+    if isinstance(payload, dict) and payload.get("hook_event_name") in {"Stop", "SubagentStop"}:
+        # These events expect JSON output. An empty object makes no continuation
+        # request and provides no instruction or permission decision.
+        print("{}")
     return 0
 
 

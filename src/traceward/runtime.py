@@ -7,21 +7,30 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Callable
 
 from .config import OBSERVER_KEYS
 
-RUNNER_IMAGE = "ghcr.io/traceward/runner:0.2.0"
+RUNNER_IMAGE = "ghcr.io/traceward/runner:0.2.0-delete1"
 HOOK_COMMAND = "PYTHONPATH=/opt/traceward-hooks /usr/local/bin/python3 -m traceward.hook_sink"
+# Codex 0.159.3: verified against its generated ManagedHooksRequirements schema.
+CODEX_HOOK_EVENTS = (
+    "SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PermissionRequest",
+    "PostToolUse", "PreCompact", "PostCompact", "SubagentStart", "SubagentStop", "Stop", "Interrupt",
+)
 
 
 def hook_overrides() -> list[str]:
-    handler = '{type="command",command=' + json.dumps(HOOK_COMMAND) + ',timeout=5}'
-    return ["-c", f"hooks.SessionStart=[{{hooks=[{handler}]}}]",
-            "-c", f'hooks.PreToolUse=[{{matcher="Bash|apply_patch",hooks=[{handler}]}}]',
-            "-c", f'hooks.PostToolUse=[{{matcher="Bash|apply_patch",hooks=[{handler}]}}]']
+    overrides = []
+    for event in CODEX_HOOK_EVENTS:
+        timeout = 3 if event in {"SessionEnd", "Interrupt"} else 5
+        handler = '{type="command",command=' + json.dumps(HOOK_COMMAND) + f',timeout={timeout}' + '}'
+        # No matcher: observe every tool exposed by Codex, including MCP tools.
+        overrides.extend(["-c", f"hooks.{event}=[{{hooks=[{handler}]}}]"])
+    return overrides
 
 
 def checked(command: list[str], **kwargs) -> str:
@@ -29,6 +38,13 @@ def checked(command: list[str], **kwargs) -> str:
     if result.returncode:
         raise RuntimeError(f"{command[0]} setup failed: {result.stderr[-1500:]}")
     return result.stdout.strip()
+
+
+def verify_runtime_capability(image: str) -> None:
+    result = subprocess.run(['docker', 'run', '--rm', '--network', 'none', '--entrypoint', 'runsc',
+                             image, 'trace', 'metadata'], capture_output=True, text=True, timeout=20)
+    if result.returncode or 'Name: sentry/file_delete,' not in result.stdout:
+        raise RuntimeError('incompatible runner: required sentry/file_delete capability missing; rebuild the TraceWard runner')
 
 
 def ensure_image(image: str) -> dict:
@@ -179,6 +195,8 @@ class ManagedRuntime:
                              target, writable) for source, target, writable in guest_mounts]
         else:
             inspected = spec.ensure_default_image() if spec.ensure_default_image and not image else ensure_image(self.image)
+            if image or (not spec.ensure_default_image and self.image != RUNNER_IMAGE):
+                verify_runtime_capability(self.image)
             self.metadata["runner_image_id"] = inspected["Id"]
             self.metadata["abi"] = inspected["Architecture"]
             self.command = ["docker", "run", "--rm", "--name", self.container,
@@ -226,6 +244,20 @@ class ManagedRuntime:
         else:
             subprocess.run(["docker", "kill", "--signal", str(signum), self.container],
                            capture_output=True)
+
+    def await_final_status(self, cancelled=lambda: False, timeout=5):
+        from .collector_status import read_status
+        if self.embedded: return
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not cancelled():
+            if read_status(self.run_dir / 'runtime-status.json').get('finalized'): return
+            try:
+                result = subprocess.run(['docker', 'inspect', '-f', '{{.State.Running}}', self.container],
+                    capture_output=True, text=True, timeout=min(1, max(.1, deadline-time.monotonic())))
+            except (OSError, subprocess.TimeoutExpired):
+                return
+            if result.returncode or result.stdout.strip() != 'true': return
+            time.sleep(.1)
 
     def cleanup(self):
         (self.run_dir / "request.json").unlink(missing_ok=True)

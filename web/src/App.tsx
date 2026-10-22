@@ -14,7 +14,7 @@ const kind = (event: Event) => {
   if (event.class_uid === 1001)
     return event.activity_name === "Read"
       ? "file_read"
-      : event.activity_name === "Update"
+      : event.activity_name === "Delete" ? "file_delete" : event.activity_name === "Update"
         ? "file_write"
         : "file_open";
   if (event.class_uid === 1007) return "process";
@@ -33,7 +33,7 @@ const eventTitle = (event: Event) => {
   if (kind(event) === 'independent_validation') return detail?.passed === true ? 'Independent validation passed' : detail?.passed === false ? 'Independent validation failed' : 'Independent validation unavailable';
   const outcome = meta?.operation_status === "failed" ? "Failed attempt · " : meta?.operation_status === "pending" ? "Pending connection · " : "";
   if (kind(event) === "hook")
-    return `${meta?.hook_event || "Hook"} · ${meta?.apparent_command || "tool call"}`;
+    return `${meta?.hook_event || "Hook"} · ${meta?.apparent_command || meta?.tool_name || "Lifecycle event"}`;
   if (kind(event) === "process")
     return event.process?.cmd_line || event.process?.name || "Process launched";
   if (kind(event).startsWith("file"))
@@ -52,6 +52,7 @@ const icon: Record<string, string> = {
   process: "▣",
   file_open: "◫",
   file_read: "↘",
+  file_delete: "×",
   file_write: "↗",
   network: "◎",
   network_send: "↗",
@@ -105,6 +106,14 @@ function EventDetails({selectedEvent, openRaw}: {selectedEvent: Event; openRaw: 
                         {eventPid(selectedEvent) || "—"}
                       </b>
                     </div>
+                    {kind(selectedEvent) === 'hook' && <>
+                      <div className="detail-pair"><span>Hook event</span><b>{selectedEvent.unmapped?.traceward?.hook_event}</b></div>
+                      {selectedEvent.unmapped?.traceward?.native_event && <div className="detail-pair"><span>Native event</span><code>{selectedEvent.unmapped.traceward.native_event}</code></div>}
+                      {selectedEvent.unmapped?.traceward?.session_id && <div className="detail-pair"><span>Session</span><code>{selectedEvent.unmapped.traceward.session_id}</code></div>}
+                      {selectedEvent.unmapped?.traceward?.turn_id != null && <div className="detail-pair"><span>Turn</span><code>{selectedEvent.unmapped.traceward.turn_id}</code></div>}
+                      {selectedEvent.unmapped?.traceward?.result_status && <div className="detail-pair"><span>Tool outcome</span><b>{selectedEvent.unmapped.traceward.result_status}</b></div>}
+                      {Object.entries(selectedEvent.unmapped?.traceward?.hook_metadata || {}).map(([key, value]) => <div className="detail-pair" key={key}><span>{key.replaceAll('_', ' ')}</span><code>{String(value)}</code></div>)}
+                    </>}
                     {selectedEvent.unmapped?.traceward?.tool_use_id && (
                       <div className="detail-pair">
                         <span>Tool call</span>
@@ -113,6 +122,9 @@ function EventDetails({selectedEvent, openRaw}: {selectedEvent: Event; openRaw: 
                         </code>
                       </div>
                     )}
+                    {selectedEvent.unmapped?.traceward?.syscall && <div className="detail-pair"><span>Syscall</span><code>{selectedEvent.unmapped.traceward.syscall}</code></div>}
+                    {selectedEvent.unmapped?.traceward?.path_resolution && <div className="detail-pair"><span>Path resolution</span><code>{selectedEvent.unmapped.traceward.path_resolution}</code></div>}
+                    {kind(selectedEvent) === 'file_delete' && <p>Directory-entry removal; this does not establish destruction of all copies or contents.</p>}
                     {selectedEvent.unmapped?.traceward?.operation_status && <div className="detail-pair"><span>Operation outcome</span><b>{selectedEvent.unmapped.traceward.operation_status}{selectedEvent.unmapped.traceward.errno ? ` · errno ${selectedEvent.unmapped.traceward.errno}` : ""}</b></div>}
                     {selectedEvent.unmapped?.traceward?.byte_count !== undefined && <div className="detail-pair"><span>Observed bytes</span><b>{selectedEvent.unmapped.traceward.byte_count}</b></div>}
                     {selectedEvent.unmapped?.traceward?.process_key && <div className="detail-pair"><span>Process identity</span><code>{selectedEvent.unmapped.traceward.process_key}</code></div>}
@@ -214,6 +226,10 @@ export default function App() {
   const [view, setView] = useState<"combined" | "hooks" | "runtime">(
     "combined",
   );
+  const [hookFilter, setHookFilter] = useState('all');
+  const [hookNames, setHookNames] = useState<string[]>([]);
+  const hooksOnly = view === 'hooks' || filter === 'hook';
+  const eventQuery = hooksOnly ? `&kind=hook${hookFilter === 'all' ? '' : `&hook_event=${encodeURIComponent(hookFilter)}`}` : '';
   const [error, setError] = useState("");
   const [raw, setRaw] = useState<Raw | null>(null);
   const [older, setOlder] = useState<number | null>(null);
@@ -225,6 +241,9 @@ export default function App() {
   const eventInspector = useRef<HTMLElement | null>(null);
   const eventRows = useRef(new Map<string, HTMLButtonElement>());
   activeRun.current = runId;
+  const activeEventQuery = useRef(eventQuery);
+  activeEventQuery.current = eventQuery;
+  useEffect(() => { setHookFilter('all'); }, [runId]);
 
   const loadRuns = useCallback(async () => {
     try {
@@ -244,20 +263,21 @@ export default function App() {
     if (!runId) return;
     try {
       const [eventData, findingData, processData, evaluationData, assessmentData] = await Promise.all([
-        get<{ events: Event[]; next_before: number | null }>(
-          `/api/runs/${runId}/events?limit=250`,
+        get<{ events: Event[]; next_before: number | null; hook_events?: string[] }>(
+          `/api/runs/${runId}/events?limit=250${eventQuery}`,
         ),
         get<{ findings?: Finding[]; assessments?: Finding[] }>(`/api/runs/${runId}/${assessmentAudit ? 'assessments' : 'findings'}`),
         get<{ processes: Event[] }>(`/api/runs/${runId}/processes`),
         get<{ evaluations: typeof evaluations }>(`/api/runs/${runId}/evaluations`),
         get<{ assessments: Finding[] }>(`/api/runs/${runId}/assessments`),
       ]);
-      if (activeRun.current !== runId) return;
+      if (activeRun.current !== runId || activeEventQuery.current !== eventQuery) return;
       setEvents(current => {
         const merged = new Map([...current, ...eventData.events].map(e => [e.metadata.uid, e]));
         return [...merged.values()].sort((a, b) => a.time - b.time || (a.index_id || 0) - (b.index_id || 0));
       });
       setProcesses(processData.processes);
+      setHookNames(eventData.hook_events || []);
       setOlder(current => paginationStarted.current ? current : eventData.next_before);
       const visible = findingData.assessments ?? findingData.findings ?? [];
       setFindings(visible);
@@ -273,7 +293,7 @@ export default function App() {
     } catch (exc) {
       setError(`Cannot read run: ${String(exc)}`);
     }
-  }, [runId, assessmentAudit, route.findingId]);
+  }, [runId, assessmentAudit, route.findingId, eventQuery]);
   useEffect(() => {
     const navigate = () => { setRoute(readRoute()); setAssessmentAudit(false); setRaw(null); };
     window.addEventListener("hashchange", navigate);
@@ -313,6 +333,9 @@ export default function App() {
   }, [loadRun, runId]);
   const run = runs.find((item) => item.run_id === runId);
   const finding = findings.find((item) => item.finding_id === selectedFinding);
+  const effectiveJudge = finding?.effective_judge ?? (finding?.assessment_attempt_status ? null : finding?.judge);
+  const cancelledAssessment = finding?.assessment_attempt_status === 'cancelled';
+  const endedPending = finding?.judge?.reason === 'session_ended_before_assessment';
   useEffect(() => {
     if (!runId || !finding?.evidence_ids?.length) {
       setEvidence([]);
@@ -328,7 +351,7 @@ export default function App() {
   }, [runId, finding?.finding_id, finding?.revision]);
   const shown = useMemo(
     () =>
-      (filter === "evidence" && finding ? evidence : events).filter((event) => {
+      (filter === "evidence" && finding && !hooksOnly ? evidence : events).filter((event) => {
         const itemKind = kind(event);
         if (view === "hooks" && itemKind !== "hook") return false;
         if (
@@ -340,7 +363,7 @@ export default function App() {
           return false;
         return filter === "all" || filter === "evidence" || itemKind === filter;
       }),
-    [events, evidence, finding, filter, view],
+    [events, evidence, finding, filter, view, hooksOnly],
   );
   const orderedEvents = useMemo(() => eventOrder === 'newest' ? [...shown].reverse() : shown, [shown, eventOrder]);
   const processDepths = useMemo(() => {
@@ -373,9 +396,9 @@ export default function App() {
     if (!older || !runId) return;
     paginationStarted.current = true;
     const result = await get<{ events: Event[]; next_before: number | null }>(
-      `/api/runs/${runId}/events?limit=250&before=${older}`,
+      `/api/runs/${runId}/events?limit=250&before=${older}${eventQuery}`,
     );
-    if (activeRun.current !== runId) return;
+    if (activeRun.current !== runId || activeEventQuery.current !== eventQuery) return;
     setEvents((current) => [...new Map([...result.events, ...current].map(e => [e.metadata.uid, e])).values()]
       .sort((a, b) => a.time - b.time || (a.index_id || 0) - (b.index_id || 0)));
     setOlder(result.next_before);
@@ -405,7 +428,7 @@ export default function App() {
     setSelectedEvent(event);
     if (window.matchMedia('(max-width: 1100px)').matches) {
       window.requestAnimationFrame(() => {
-        if (activeRun.current !== runId) return;
+        if (activeRun.current !== runId || activeEventQuery.current !== eventQuery) return;
         eventInspector.current?.scrollIntoView({block: 'start'});
         eventInspector.current?.focus({preventScroll: true});
       });
@@ -460,7 +483,7 @@ export default function App() {
                 <div className="eyebrow">
                   RUN{" "}
                   <span className={`status-label ${run.status}`}>
-                    {run.status}
+                    {run.status}{run.analysis_incomplete ? " · analysis incomplete" : ""}
                   </span>
                 </div>
                 <h1>Agent Run Investigation</h1>
@@ -504,6 +527,8 @@ export default function App() {
                 <small>{run.assessment_count ?? run.finding_count} internal assessments</small>
               </div>
             </div>
+            {run.telemetry_status && run.telemetry_status.status !== 'complete' && <p className="coverage-status" role="status">{run.telemetry_status.message}</p>}
+            {run.analysis_incomplete && <p className="analysis-status" role="status">Session ended; final analysis is incomplete.</p>}
             <ActivityChart key={runId} runId={runId} live={run.status === 'live'} onFinding={id => {
               setSelectedFinding(id); setAssessmentAudit(false);
               window.location.hash = `runs/${runId}?finding=${id}&view=findings`;
@@ -550,13 +575,13 @@ export default function App() {
                     </button>
                     <button
                       className={view === "hooks" ? "on" : ""}
-                      onClick={() => setView("hooks")}
+                      onClick={() => { setView("hooks"); setFilter("hook"); }}
                     >
                       Hooks only
                     </button>
                     <button
                       className={view === "runtime" ? "on" : ""}
-                      onClick={() => setView("runtime")}
+                      onClick={() => { setView("runtime"); if (filter === "hook") setFilter("all"); }}
                     >
                       Runtime only
                     </button>
@@ -565,6 +590,10 @@ export default function App() {
                   {tab === 'timeline' && <select aria-label="Event order" value={eventOrder} onChange={event => setEventOrder(event.target.value as 'newest' | 'oldest')}>
                     <option value="newest">Newest first</option>
                     <option value="oldest">Oldest first</option>
+                  </select>}
+                  {hooksOnly && <select aria-label="Hook event" value={hookFilter} onChange={event => setHookFilter(event.target.value)}>
+                    <option value="all">All hook events</option>
+                    {hookNames.map(name => <option key={name} value={name}>{name}</option>)}
                   </select>}
                   <select
                     aria-label="Event type"
@@ -577,6 +606,7 @@ export default function App() {
                     <option value="process">Processes</option>
                     <option value="file_read">File reads</option>
                     <option value="file_write">File writes</option>
+                    <option value="file_delete">File deletions</option>
                     <option value="network_send">Network sends</option>
                     <option value="http_request">HTTP requests</option>
                     <option value="finding">Findings</option>
@@ -728,19 +758,25 @@ export default function App() {
                               </small>
                             </div>
                             {finding.assessment_note && <p className="assessment-note">{finding.assessment_note}</p>}
-                            {finding.analysis_window && <p className="window-status">Rolling {finding.analysis_window.duration_seconds}-second observation window with relevant earlier causal evidence. {finding.analysis_window.agent_finished ? 'Final session context.' : 'Assessed while the session was running; new evidence feeds later windows.'}</p>}
+                            {finding.analysis_window && <p className="window-status">Rolling {finding.analysis_window.duration_seconds}-second observation window with relevant earlier causal evidence. {finding.analysis_window.agent_finished ? 'Final session context.' : run.status === 'live' ? 'Assessed while the session was running; new evidence feeds later windows.' : 'Assessed during execution.'}</p>}
+                            {cancelledAssessment && <p className="assessment-status" role="status">{effectiveJudge
+                              ? 'Earlier assessment retained. Final reassessment cancelled during shutdown.'
+                              : 'Assessment cancelled; no completed verdict.'}</p>}
+                            {finding.effective_judge_error && <p role="status">{finding.effective_judge_error}</p>}
+                            {endedPending && <p className="assessment-status" role="status">{effectiveJudge ? 'Earlier assessment retained. Additional evidence was pending when the session ended.' : 'Session ended before assessment completed. Evidence saved for replay.'}</p>}
+                            {!cancelledAssessment && !endedPending && finding.retained_review_revision && <p role="status">Earlier assessment retained. Latest reassessment unavailable.</p>}
                             <div className="section-label">
-                              DECISION MODEL · {finding.judge?.status === "unavailable"
+                              DECISION MODEL · {endedPending && !effectiveJudge ? "ASSESSMENT PENDING" : effectiveJudge?.status === "unavailable"
                                 ? "UNAVAILABLE"
-                                : finding.judge?.model || "PENDING"}
+                                : effectiveJudge?.model || (cancelledAssessment ? "ASSESSMENT CANCELLED" : finding.judge ? "UNAVAILABLE" : "PENDING")}
                             </div>
-                            {finding.judge?.status === "assessed" ? (
+                            {effectiveJudge?.status === "assessed" ? (
                               <div className="score-card structured-assessment">
                                 <div className="score-top">
-                                  <div><span>MODEL VERDICT</span><strong>{finding.judge.disposition?.replaceAll("_", " ")}</strong></div>
-                                  <span className="score-tag">{finding.judge.model?.includes("demo") ? "SIMULATED EVALUATOR" : finding.judge.contract_version === 'goal-effects-live-v1' ? 'STRUCTURED LIVE REVIEW' : "STRUCTURED MODEL REVIEW"}</span>
+                                  <div><span>MODEL VERDICT</span><strong>{effectiveJudge.disposition?.replaceAll("_", " ")}</strong></div>
+                                  <span className="score-tag">{effectiveJudge.model?.includes("demo") ? "SIMULATED EVALUATOR" : effectiveJudge.contract_version?.startsWith('goal-effects-live-') ? 'STRUCTURED LIVE REVIEW' : "STRUCTURED MODEL REVIEW"}</span>
                                 </div>
-                                <p className="judge-rationale">{finding.judge.rationale}</p>
+                                <p className="judge-rationale">{effectiveJudge.rationale}</p>
                                 {finding.assessment && <div className="assessment-facets">
                                   {Object.entries(finding.assessment).map(([name, facet]) => <section key={name} className="assessment-facet" data-status={facet.status}>
                                     <div><strong>{name.replaceAll('_', ' ')}</strong><span>{facet.status.replaceAll('_', ' ')}</span></div>
@@ -752,11 +788,11 @@ export default function App() {
                                   <ul>{finding.verified_claims.map((claim, i) => <li key={i}>{claim.fact_type.replaceAll('_', ' ')} · {claim.evidence_ids.map(id => short(id)).join(', ')}</li>)}</ul>
                                   <p>These checks validate typed evidence predicates; model interpretations can still be wrong.</p>
                                 </div> : null}
-                                <EvidenceCitations key={`${finding.finding_id}:${finding.revision}:judge`} ids={finding.judge.cited_evidence_ids || []} evidence={evidence} label="Judge" openRaw={openRaw} />
+                                <EvidenceCitations key={`${finding.finding_id}:${finding.revision}:judge`} ids={effectiveJudge.cited_evidence_ids || []} evidence={evidence} label="Judge" openRaw={openRaw} />
                                 <p>No numerical risk score. This verdict is not a confirmed violation or proof of safety.</p>
                                 <p>Experimental judgement: validation covers reviewed cases; production accuracy is not established.</p>
                               </div>
-                            ) : finding.judge?.status === "scored" ? (
+                            ) : effectiveJudge?.status === "scored" ? (
                               <div className="score-card">
                                 <div className="score-top">
                                   <div>
@@ -770,12 +806,12 @@ export default function App() {
                                     </strong>
                                   </div>
                                   <span className="score-tag">
-                                    {finding.judge?.model?.includes("demo") ? "SIMULATED EVALUATOR" : "MODEL REVIEW"}
+                                    {effectiveJudge?.model?.includes("demo") ? "SIMULATED EVALUATOR" : "MODEL REVIEW"}
                                   </span>
                                 </div>
                                 <div className="score-bars">
                                   {Object.entries(
-                                    finding.judge.dimensions || {},
+                                    effectiveJudge.dimensions || {},
                                   ).map(([key, value]) => (
                                     <div key={key}>
                                       <div>
@@ -790,16 +826,16 @@ export default function App() {
                                   This score is not a probability of
                                   misalignment or a confirmed violation.
                                 </p>
-                                {finding.judge.semantic_accuracy_validated === false && (
+                                {effectiveJudge.semantic_accuracy_validated === false && (
                                   <p>Experimental judgement: semantic accuracy is not validated. Historical scores are uncalibrated and do not establish production accuracy.</p>
                                 )}
                                 {run.legacy && <p>Historical assessment: limited context and simulated scores have not been revalidated.</p>}
                               </div>
                             ) : (
                               <div className="model-unavailable">
-                                {finding.judge
+                                {endedPending ? 'Assessment pending at session exit; no completed verdict.' : cancelledAssessment ? 'Final assessment was cancelled during shutdown.' : finding.judge
                                   ? `Judgement unavailable (${finding.judge.reason || "no score"}${finding.judge.validation_error ? `: ${finding.judge.validation_error}` : ''}).`
-                                  : "Provisional finding. Waiting for the decision model…"}{" "}
+                                  : "Investigation awaiting model assessment…"}{" "}
                                 The observed evidence remains available.
                               </div>
                             )}
@@ -832,7 +868,7 @@ export default function App() {
                                         ? "Simulated evaluator"
                                         : "Model evaluation"
                                       : item.judge
-                                        ? "Model unavailable"
+                                        ? (item.judge.reason === "assessment_cancelled_on_shutdown" ? "Assessment cancelled" : "Model unavailable")
                                         : "Provisional evidence finding"}
                                   </span>
                                   <time>{date(item.time)}</time>

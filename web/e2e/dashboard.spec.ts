@@ -341,3 +341,78 @@ test('stacked activity and finding windows update live and open the related find
  expect(await page.locator('body').evaluate(el=>el.scrollWidth)).toBeLessThanOrEqual(390);
  await page.goto('about:blank');
 });
+
+test('all lifecycle hooks are visible beyond finding citations and runtime pagination',async({page,request})=>{
+ const response=await request.post('/test/hooks');
+ const {run_id}=await response.json();
+ await page.goto(`/#runs/${run_id}?view=evidence`);
+ await page.getByRole('tab',{name:'Evidence Stream',exact:true}).click();
+ await page.getByRole('button',{name:'Hooks only',exact:true}).click();
+ await expect(page.locator('[data-kind="hook"]')).toHaveCount(7);
+ await expect(page.locator('[data-kind="file_read"]')).toHaveCount(0);
+ await expect(page.getByLabel('Hook event')).toBeVisible();
+ await expect(page.getByLabel('Hook event').locator('option')).toHaveCount(8);
+ await page.getByLabel('Hook event').selectOption('SessionStart');
+ await expect(page.locator('[data-kind="hook"]')).toHaveCount(1);
+ await page.locator('[data-kind="hook"]').click();
+ await expect(page.locator('.detail-pair').filter({hasText:'Native event'})).toContainText('session_start');
+ await expect(page.locator('.detail-pair').filter({has:page.locator('span', {hasText:/^Session$/})})).toContainText('synthetic-session');
+ await expect(page.locator('.detail-pair').filter({hasText:'reason'})).toContainText('startup');
+ await expect(page.locator('.event-title')).toHaveText('SessionStart · Lifecycle event');
+ await page.getByLabel('Hook event').selectOption('PostToolUse');
+ await page.locator('[data-kind="hook"]').click();
+ await expect(page.locator('.detail-pair').filter({hasText:'Tool outcome'})).toContainText('ok');
+ await expect(page.locator('.event-title')).toHaveText('PostToolUse · Bash');
+ await page.getByLabel('Hook event').selectOption('all');
+ await expect(page.locator('[data-kind="hook"]')).toHaveCount(7);
+});
+
+test('retained model verdict, cancellation and telemetry finalization remain distinct',async({page,request})=>{
+ const response=await request.post('/test/deletion-report/retained');
+ const {run_id}=await response.json();
+ await page.goto(`/#runs/${run_id}?view=findings`);
+ await expect(page.locator('.judge-rationale')).toContainText('conflicts with the read-only goal');
+ await expect(page.getByText('Earlier assessment retained. Final reassessment cancelled during shutdown.',{exact:true})).toBeVisible();
+ await expect(page.locator('.section-label').filter({hasText:'DECISION MODEL'})).toContainText('qwen-synthetic-browser');
+ await expect(page.locator('.model-unavailable')).toHaveCount(0);
+ await expect(page.getByText('Session ended; final analysis is incomplete.',{exact:true})).toBeVisible();
+ await expect(page.locator('.coverage-status')).toContainText('Telemetry observed; final collector status/counters unavailable');
+ await page.getByRole('button',{name:'Judge evidence file delete · empty.txt',exact:true}).click();
+ await expect(page.locator('.detail-pair').filter({hasText:'Syscall'})).toContainText('unlinkat');
+ await page.getByRole('button',{name:'Close evidence details',exact:true}).click();
+ await page.getByRole('tab',{name:'Evidence Stream',exact:true}).click();
+ await page.getByLabel('Event type').selectOption('file_delete');
+ await expect(page.locator('[data-kind="file_delete"]')).toHaveCount(1);
+ await expect(page.getByRole('region',{name:'Activity over time'}).locator('[data-series="file_delete"]')).toHaveCount(1);
+ for(const mode of ['cancelled','outage']) {
+  const next=await request.post(`/test/deletion-report/${mode}`);
+  const nextId=(await next.json()).run_id;
+  await page.goto(`/#runs/${nextId}?view=findings`);
+  await page.getByRole('button',{name:'Assessment audit',exact:true}).click();
+  if(mode==='cancelled') {
+   await expect(page.getByText('Assessment cancelled; no completed verdict.',{exact:true})).toBeVisible();
+   await expect(page.locator('.section-label').filter({hasText:'DECISION MODEL'})).toContainText('ASSESSMENT CANCELLED');
+  } else {
+   await expect(page.locator('.model-unavailable')).toContainText('connection_failed');
+   await expect(page.locator('.section-label').filter({hasText:'DECISION MODEL'})).toContainText('UNAVAILABLE');
+  }
+ }
+});
+
+test('fast exit distinguishes pending evidence from model failure and retains completed reviews',async({page,request})=>{
+ for(const mode of ['pending','retained-pending']) {
+  const response=await request.post(`/test/deletion-report/${mode}`);
+  const {run_id}=await response.json();
+  await page.goto(`/#runs/${run_id}?view=findings`);
+  if(mode==='pending') {
+   await page.getByRole('button',{name:'Assessment audit',exact:true}).click();
+   await expect(page.getByText('Session ended before assessment completed. Evidence saved for replay.',{exact:true})).toBeVisible();
+   await expect(page.locator('.section-label').filter({hasText:'DECISION MODEL'})).toContainText('ASSESSMENT PENDING');
+   await expect(page.locator('.model-unavailable')).toContainText('Assessment pending at session exit');
+  } else {
+   await expect(page.getByText('Earlier assessment retained. Additional evidence was pending when the session ended.',{exact:true})).toBeVisible();
+   await expect(page.locator('.judge-rationale')).toContainText('conflicts with the read-only goal');
+   await expect(page.locator('.model-unavailable')).toHaveCount(0);
+  }
+ }
+});

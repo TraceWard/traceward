@@ -8,22 +8,27 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
+from . import openrouter
 from .evidence_packet import model_input
 from .privacy import redact
-from .structured import request_payload, strict_object, validate_response, factual_predicates
+from .structured import request_payload, strict_object, validate_response, factual_predicates, RUBRIC_VERSION
 
 DEFAULT_MODEL = 'qwen/qwen3.8-27b'
 DEFAULT_URL = 'http://127.0.0.1:1234/v1/chat/completions'
+OPENROUTER_URL = openrouter.CHAT_URL
+JUDGE_PROVIDERS = {'lmstudio', 'openrouter'}
 MAX_RESPONSE_BYTES = 256 * 1024
 
 
-def sanitized(value):
+def sanitized(value, secrets=()):
     if isinstance(value, str):
+        for secret in secrets:
+            if secret: value = value.replace(secret, "[REDACTED]")
         return redact(value, 1000000)
     if isinstance(value, dict):
-        return {k: sanitized(v) for k, v in value.items()}
+        return {k: sanitized(v, secrets) for k, v in value.items()}
     if isinstance(value, list):
-        return [sanitized(v) for v in value]
+        return [sanitized(v, secrets) for v in value]
     return value
 
 
@@ -41,20 +46,37 @@ def endpoint(value):
     return urlunsplit((parsed.scheme, parsed.netloc, path, '', ''))
 
 
-def generative_judge(packet, *, url=None, model=None, timeout=60):
-    selected_model = model or os.environ.get('TRACEWARD_JUDGE_MODEL', DEFAULT_MODEL)
-    selected_url = endpoint(url or os.environ.get('TRACEWARD_JUDGE_URL', DEFAULT_URL))
-    live = bool(packet.get('live_window'))
+def generative_judge(packet, *, url=None, model=None, provider=None, timeout=60):
+    selected_provider = provider or os.environ.get('TRACEWARD_JUDGE_PROVIDER', 'lmstudio')
+    if selected_provider not in JUDGE_PROVIDERS:
+        return {'status':'unavailable','reason':'unsupported_judge_provider'}
+    selected_model = model or os.environ.get('TRACEWARD_JUDGE_MODEL')
+    if selected_provider == 'openrouter':
+        selected_url = OPENROUTER_URL
+        token = os.environ.get('OPENROUTER_KEY', '').strip()
+        if not selected_model or not selected_model.strip():
+            return {'status':'unavailable','reason':'missing_judge_model','provider':selected_provider,'endpoint':selected_url}
+        if not token:
+            return {'status':'unavailable','reason':'missing_openrouter_key','provider':selected_provider,
+                    'endpoint':selected_url,'requested_model':selected_model,'model':selected_model}
+    else:
+        selected_model = selected_model or DEFAULT_MODEL
+        selected_url = endpoint(url or os.environ.get('TRACEWARD_JUDGE_URL', DEFAULT_URL))
+        # Keep the former observer token as an LM Studio compatibility alias.
+        token = os.environ.get('LMSTUDIO_API_KEY') or os.environ.get('TRACEWARD_JUDGE_TOKEN')
+    realtime = packet.get('assessment_contract') == 'goal-effects-live-v2'
+    live = bool(packet.get('live_window')) and not realtime
     enriched = packet.get('packet_version', 2) >= 3 and not live
     rendered = model_input(packet, max_state_bytes=12288 if enriched else 8192)
     visible_aliases = {a:eid for a,eid in rendered.get('evidence_aliases',{}).items()
                        if eid in rendered.get('represented_evidence_ids',[])}
     facts = factual_predicates(packet.get('evidence',[]),visible_aliases,packet.get('consequential_evidence_ids',[])) if enriched else None
-    body = request_payload(rendered.get('state', ''), selected_model, enriched=enriched, facts=facts,evidence_aliases=visible_aliases, live=live)
+    body = request_payload(rendered.get('state', ''), selected_model, enriched=enriched, facts=facts,evidence_aliases=visible_aliases, live=live, realtime=realtime)
+    if selected_provider == 'openrouter': body = openrouter.adapt_request(body)
     encoded = json.dumps(body).encode()
     started = time.monotonic()
-    provenance = {'provider': 'lmstudio', 'contract_version': 'goal-effects-live-v1' if live else 'goal-effects-v4' if enriched else 'goal-effects-v3',
-        'endpoint': selected_url, 'requested_model': selected_model, 'model': selected_model,
+    provenance = {'provider': selected_provider, 'contract_version': 'goal-effects-live-v2' if realtime else 'goal-effects-live-v1' if live else 'goal-effects-v4' if enriched else 'goal-effects-v3',
+        'endpoint': selected_url, 'requested_model': selected_model, 'model': selected_model, 'rubric_version': RUBRIC_VERSION,
         'request_sha256': hashlib.sha256(encoded).hexdigest(), 'request': body,
         'model_input': rendered, 'question_contract': body['response_format'],
         'evaluation_source': 'simulated' if 'demo' in selected_model.lower() else 'remote_model', 'semantic_accuracy_validated': False}
@@ -66,7 +88,6 @@ def generative_judge(packet, *, url=None, model=None, timeout=60):
     if enriched and len(body['messages'][1]['content'].encode()) > 14336:
         return unavailable('verified_predicates_exceed_input_budget')
     headers = {'Content-Type': 'application/json'}
-    token = os.environ.get('TRACEWARD_JUDGE_TOKEN')
     if token:
         headers['Authorization'] = 'Bearer ' + token
     try:
@@ -80,9 +101,15 @@ def generative_judge(packet, *, url=None, model=None, timeout=60):
         return unavailable(type(exc).__name__, http_status=exc.code if isinstance(exc, HTTPError) else None)
     # Retain the exact redacted wire response, including rejected answers. Never
     # persist request headers or provider error bodies that may echo credentials.
-    provenance['response'] = sanitized(result)
+    result = sanitized(result, (token,) if token else ())
+    provenance['response'] = result
+    if isinstance(result, dict) and result.get('error'):
+        error = result['error']
+        return unavailable('provider_error', error_code=error.get('code') if isinstance(error, dict) else None)
     try:
-        if result['model'] != selected_model:
+        identity_matches = (openrouter.model_matches(selected_model, result['model'])
+                            if selected_provider == 'openrouter' else result['model'] == selected_model)
+        if not identity_matches:
             return unavailable('returned_model_mismatch', returned_model=redact(str(result.get('model')), 128))
         answer = validate_response(result, visible_aliases, enriched=enriched, evidence=packet.get('evidence', []),facts=facts, live=live)
         required = set(packet.get('consequential_evidence_ids', []))
@@ -109,7 +136,4 @@ def generative_judge(packet, *, url=None, model=None, timeout=60):
 
 
 def judge(packet, *, url=None, model=None, provider=None, timeout=60):
-    selected = provider or os.environ.get('TRACEWARD_JUDGE_PROVIDER', 'lmstudio')
-    if selected != 'lmstudio':
-        return {'status': 'unavailable', 'reason': 'unsupported_judge_provider'}
-    return generative_judge(packet, url=url, model=model, timeout=timeout)
+    return generative_judge(packet, url=url, model=model, provider=provider, timeout=timeout)

@@ -12,6 +12,8 @@ export type Run = {
   started_at: number;
   updated_at: number;
   status: "live" | "complete" | "incomplete";
+  analysis_incomplete?: boolean;
+  telemetry_status?: {status: string; trace_established: boolean | null; finalized: boolean; message: string};
   summary: Summary | null;
   event_counts: Record<string, number>;
   finding_count: number;
@@ -50,6 +52,12 @@ export type Event = {
       parent_process_key?: string;
       raw_trace_ref?: string;
       hook_event?: string;
+      native_event?: string;
+      hook_metadata?: Record<string, string | number | boolean>;
+      tool_name?: string;
+      session_id?: string;
+      turn_id?: string;
+      result_status?: string;
       apparent_command?: string;
       tool_use_id?: string;
       endpoint?: string;
@@ -58,11 +66,24 @@ export type Event = {
       errno?: number;
       result?: number;
       exit_status?: number;
+      path_resolution?: string;
+      syscall?: string;
+      directory?: boolean;
       details?: Record<string, unknown>;
     };
   };
 };
+export type Judge = {
+    status: string; reason?: string; validation_error?: string; contract_version?: string;
+    model?: string; semantic_accuracy_validated?: boolean; dimensions?: Record<string, number>;
+    disposition?: string; rationale?: string; cited_evidence_ids?: string[];
+};
 export type Finding = {
+  retained_review_revision?: number;
+  effective_judge?: Judge | null;
+  effective_judge_revision?: number | null;
+  effective_judge_error?: string | null;
+  assessment_attempt_status?: 'pending' | 'assessed' | 'cancelled' | 'unavailable';
   finding_id: string;
   revision: number;
   time: number;
@@ -81,18 +102,7 @@ export type Finding = {
   analysis_window?: {duration_seconds: number; stride_seconds: number; agent_finished: boolean};
   assessment?: Record<string, {status: string; summary: string; evidence_ids: string[]}>;
   verified_claims?: {fact_type: string; evidence_ids: string[]}[];
-  judge?: {
-    status: string;
-    reason?: string;
-    validation_error?: string;
-    contract_version?: string;
-    model?: string;
-    semantic_accuracy_validated?: boolean;
-    dimensions?: Record<string, number>;
-    disposition?: string;
-    rationale?: string;
-    cited_evidence_ids?: string[];
-  };
+  judge?: Judge;
   revisions: Finding[];
 };
 export type Raw = { source: string; lines: { line: number; text: string }[] };

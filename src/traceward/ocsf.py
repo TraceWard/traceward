@@ -21,6 +21,7 @@ CLASSES = {
     "coverage": (0, "Base Event", 0, "Uncategorized", 99, "Other"),
     "process_exit": (1007, "Process Activity", 1, "System Activity", 2, "Terminate"),
     "process": (1007, "Process Activity", 1, "System Activity", 1, "Launch"),
+    "file_delete": (1001, "File System Activity", 1, "System Activity", 4, "Delete"),
     "file_open": (1001, "File System Activity", 1, "System Activity", 14, "Open"),
     "file_read": (1001, "File System Activity", 1, "System Activity", 2, "Read"),
     "file_write": (1001, "File System Activity", 1, "System Activity", 3, "Update"),
@@ -54,12 +55,12 @@ def project(kind: str, item: dict, run_id: str) -> dict:
         "unmapped": {"traceward": {"run_id": run_id, "source": item.get("source", "traceward"),
                                    "event_id": event_id, "event_kind": kind}},
     }
-    if kind in {"process", "file_open", "file_read", "file_write"}:
+    if kind in {"process", "file_open", "file_read", "file_write", "file_delete"}:
         record["device"] = {"hostname": socket.gethostname(), "type_id": 0}
     if item.get("raw_trace_ref"):
         record["unmapped"]["traceward"]["raw_trace_ref"] = item["raw_trace_ref"]
     for key in ("process_key", "parent_process_key", "process_start_time_ns", "sandbox_id",
-                "syscall_number", "result", "errno", "operation_status", "path_resolution", "exit_status", "message_count"):
+                "syscall_number", "result", "errno", "operation_status", "path_resolution", "exit_status", "message_count", "pathname", "start_path", "dirfd", "flags", "directory", "path_error", "syscall"):
         if item.get(key) is not None:
             record["unmapped"]["traceward"][key] = item[key]
     if item.get("operation_status"):
@@ -73,7 +74,7 @@ def project(kind: str, item: dict, run_id: str) -> dict:
         record["process"] = proc
         record["unmapped"]["traceward"]["script_paths"] = [redact(path, 256) for path in item.get("script_paths", [])[:8]]
         record["actor"] = {"process": {"pid": int(item.get("parent_pid") or item["pid"])}}
-    elif kind in {'file_open', 'file_read', 'file_write'}:
+    elif kind in {'file_open', 'file_read', 'file_write', 'file_delete'}:
         record["actor"] = {"process": {"pid": int(item["pid"])}}
         record["file"] = {"path": redact(item["path"], 512),
                           "name": redact(os.path.basename(item["path"]), 255),
@@ -121,6 +122,11 @@ def project(kind: str, item: dict, run_id: str) -> dict:
                  "result_status": item.get("result_status"),
                  "result_exit_code": item.get("result_exit_code")}
             )
+            record["unmapped"]["traceward"]["hook_metadata"] = item.get("hook_metadata", {})
+            if item.get("native_event"):
+                record["unmapped"]["traceward"]["native_event"] = item["native_event"]
+            if item.get("agent_pid") is not None:
+                record["unmapped"]["traceward"]["pid"] = item["agent_pid"]
     return record
 
 

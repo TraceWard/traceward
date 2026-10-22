@@ -19,6 +19,7 @@ from .gvisor import GvisorParser
 from .runtime import ManagedRuntime
 from .instructions import codex_instruction
 from .records import assessment_record
+from .collector_status import read_status, describe_status
 
 
 def state_root() -> Path:
@@ -28,7 +29,7 @@ def state_root() -> Path:
 
 def _usage() -> str:
     return (
-        "usage: traceward run [--goal TEXT | --goal-file PATH] [--context-mode metadata|redacted] [--validation-script PATH] [--permissions-file PATH] [--shared-root PATH] [--judge-provider lmstudio] [--judge-url URL] [--judge-model MODEL] [--runner-image IMAGE] [--workspace PATH] [--guest-image IMAGE] [--defer-judge] codex [AGENT FLAGS...] [INITIAL INSTRUCTION]\n"
+        "usage: traceward run [--goal TEXT | --goal-file PATH] [--context-mode metadata|redacted] [--validation-script PATH] [--permissions-file PATH] [--shared-root PATH] [--judge-provider lmstudio|openrouter] [--judge-url URL] [--judge-model MODEL] [--runner-image IMAGE] [--workspace PATH] [--guest-image IMAGE] [--defer-judge] codex [AGENT FLAGS...] [INITIAL INSTRUCTION]\n"
         "       traceward eval pi [--cases CASE...] [--trials N] [--actor-model MODEL] [--actor-url URL]\n"
         "       traceward watch RUN_ID\n"
         "       traceward dashboard [--runs-dir PATH] [--port PORT]\n"
@@ -73,8 +74,9 @@ def _parse_run(args: list[str], *, instruction_parser=codex_instruction) -> tupl
     agent_options['agent'] = args[index]
     if agent_options.get('context_mode', 'metadata') not in {'metadata', 'redacted'}:
         raise ValueError('--context-mode must be metadata or redacted')
-    if judge_options.get('provider', 'lmstudio') != 'lmstudio':
-        raise ValueError('judge provider must be lmstudio')
+    from .judges import JUDGE_PROVIDERS
+    if judge_options.get('provider', os.environ.get('TRACEWARD_JUDGE_PROVIDER', 'lmstudio')) not in JUDGE_PROVIDERS:
+        raise ValueError('judge provider must be lmstudio or openrouter')
     if goal is not None and goal_file is not None:
         raise ValueError('choose --goal or --goal-file, not both')
     agent_args = args[index + 1:]
@@ -195,7 +197,7 @@ def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_na
     engine = Engine(goal or '', store, alert_fn=alert, coverage_gaps=[],
                     workspace=runtime.metadata["workspace"],
                     defer_evaluation=defer_evaluation or pending_goal,
-                    extended_analysis=True, context_mode=context_mode,
+                    extended_analysis=True, context_mode=context_mode, realtime=not defer_evaluation,
                     graph_path=state_root().parent / 'evidence-graph.sqlite', shared_roots=shared_roots,
                     transport_endpoints=runtime.transport_endpoints,
                     agent_state_roots=runtime.agent_state_roots,
@@ -214,6 +216,7 @@ def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_na
     if interactive:
         print(f"Live findings: traceward watch {run_id}", file=sys.stderr, flush=True)
     started = last_heartbeat = time.monotonic()
+    last_state_sample = started
     trace_pos = hook_pos = 0
     trace_pending = hook_pending = ""
     http_pos, http_pending = 0, ''
@@ -222,6 +225,7 @@ def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_na
     ingestion_interrupted = False
     child = None
     finalizing = False
+    collector_waited = False
     shutdown_signal = None
     def forward(signum, _frame):
         nonlocal shutdown_signal, finalizing
@@ -296,6 +300,9 @@ def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_na
                     _write_manifest(run_dir / "run.json", run_id, goal, started_at, agent)
                     last_heartbeat = time.monotonic()
                 more_events = drain()
+                if engine.realtime and time.monotonic() - last_state_sample >= 2:
+                    for observation in states.sample(): engine.observe(observation)
+                    last_state_sample = time.monotonic()
                 if not warned_hooks and time.monotonic() - started > 15 and not engine.counts.get("hook"):
                     warned_hooks = True
                     instruction = runtime.hook_setup_hint
@@ -304,6 +311,12 @@ def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_na
                 if not more_events: time.sleep(0.1)
             exit_code = child.wait()
             finalizing = True
+            engine.stop_live_assessments()
+            if hasattr(runtime, 'await_final_status'):
+                runtime.await_final_status(lambda: engine.assessments_cancelled)
+                collector_waited = True
+            # The supervisor may have persisted more records during the grace
+            # period after Docker attachment exit. Drain those before cleanup.
             if trace_pos < trace_file.stat().st_size:
                 print(f'TraceWard: {agent} has exited; processing remaining captured events. '
                       'Press Ctrl+C or send SIGTERM again to stop waiting and save partial results.',
@@ -317,11 +330,15 @@ def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_na
                 time.sleep(0.05)
         finally:
             finalizing = True
+            engine.stop_live_assessments()
+            if not collector_waited and hasattr(runtime, 'await_final_status'):
+                runtime.await_final_status(lambda: engine.assessments_cancelled)
             runtime.cleanup()
         status_path = run_dir / "runtime-status.json"
-        status = json.loads(status_path.read_text()) if status_path.exists() else {}
-        if not status.get("handshakes") or not status.get("source_messages"):
-            engine.add_gap("gVisor telemetry was not established; run coverage is incomplete")
+        status = read_status(status_path)
+        telemetry = describe_status(status, sum(engine.counts[k] for k in
+            ('process', 'process_exit', 'file_open', 'file_read', 'file_write', 'file_delete', 'network', 'network_send')))
+        if telemetry['status'] != 'complete': engine.add_gap(telemetry['message'])
         if status.get("collector_failed") or status.get("decode_errors") or status.get("collector_dropped_messages"):
             engine.add_gap("collector failure or rejected/dropped messages; run coverage is incomplete")
         if parser.unparsed:
@@ -353,11 +370,14 @@ def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_na
         if frozen_validator:
             engine.observe(independent_validation(root, frozen_validator, runtime.image))
         waiting = sum(thread.is_alive() for thread in engine.threads)
-        if waiting and not engine.assessments_cancelled:
+        if waiting and not engine.assessments_cancelled and not engine.realtime_requested:
             print(f"TraceWard: {agent} has exited; waiting for {waiting} pending assessment{'s' if waiting != 1 else ''} to finish. "
                   "Press Ctrl+C or send SIGTERM again to stop waiting and save unfinished assessments as incomplete.",
                   file=sys.stderr, flush=True)
         engine.finish()
+        if engine.realtime_requested and engine.pending_assessment_ids:
+            print(f"TraceWard: {len(engine.pending_assessment_ids)} assessment(s) pending at session exit; "
+                  "evidence and completed verdicts saved. No shutdown model requests were started.",file=sys.stderr,flush=True)
         if engine.assessments_cancelled:
             print("TraceWard: stopped waiting for assessments; captured evidence and existing findings are retained.",
                   file=sys.stderr, flush=True)
@@ -367,6 +387,7 @@ def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_na
                    "wall_seconds": round(time.monotonic() - started, 3),
                    "unparsed_runtime_records": parser.unparsed,
                    "runtime_overhead": "see separate comparable-run measurements"}
+        summary['telemetry_status'] = telemetry
         summary['context_mode'] = context_mode
         summary['assessment_wait_cancelled'] = engine.assessments_cancelled
         if shutdown_signal is not None: summary['shutdown_signal'] = shutdown_signal

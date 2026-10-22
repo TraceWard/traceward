@@ -5,7 +5,7 @@ type Activity = {start: number | null; end: number | null; interval_seconds: num
   buckets: Bucket[]; findings: {finding_id: string; title: string; start: number; end: number; source: string}[]};
 const series = [
   ['process', 'Processes', '#5078be'], ['file_open', 'File opens', '#b7c9e3'],
-  ['file_read', 'File reads', '#48a59b'], ['file_write', 'File writes', '#dda44b'],
+  ['file_read', 'File reads', '#48a59b'], ['file_write', 'File writes', '#dda44b'], ['file_delete', 'File deletions', '#c36a6a'],
   ['network', 'Network', '#9380c8'], ['http_request', 'HTTP', '#4d9fbe'],
   ['hook', 'Agent hooks', '#7c8c9f'], ['other', 'State & context', '#d6dfe9'],
 ];

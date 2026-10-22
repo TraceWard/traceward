@@ -1,0 +1,8 @@
+{
+  "upstream_release": "release-20260928.0",
+  "upstream_commit": "6485c3fbdfe28172ced5d6aed49554cf494967db",
+  "source_url": "https://codeload.github.com/google/gvisor/tar.gz/6485c3fbdfe28172ced5d6aed49554cf494967db",
+  "source_sha256": "894316888a4b8e9d0b82441bf464eaa04e89b76d327bb2b2fc23f0480a7f8b03",
+  "patch_sha256": "67dddfd92a8de5e44aca53aa6a00ae54bdc676326dc0f1345c398ce421847759",
+  "capability": "sentry/file_delete-v1"
+}

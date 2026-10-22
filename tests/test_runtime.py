@@ -2,15 +2,54 @@
 import json
 import os
 import tempfile
+import tomllib
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from traceward.cli import _parse_run
-from traceward.runtime import ManagedRuntime, codex_home, hook_overrides, workspace_root
+from traceward.runtime import CODEX_HOOK_EVENTS, ManagedRuntime, codex_home, hook_overrides, workspace_root
+from traceward.hook_sink import compact_hook
+from traceward.ocsf import project
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_all_codex_hooks_are_passive_and_unfiltered(self):
+        overrides = hook_overrides()
+        config = tomllib.loads('\n'.join(overrides[1::2]))['hooks']
+        self.assertEqual(set(config), set(CODEX_HOOK_EVENTS))
+        self.assertEqual(len(config), 12)
+        for event, groups in config.items():
+            self.assertNotIn('matcher', groups[0])
+            handler = groups[0]['hooks'][0]
+            self.assertEqual(handler['type'], 'command')
+            if event in {'Interrupt', 'SessionEnd'}:
+                self.assertLessEqual(handler['timeout'], 3)
+
+    def test_lifecycle_metadata_survives_projection_without_prompt_capture(self):
+        for event in CODEX_HOOK_EVENTS:
+            hook = compact_hook({'hook_event_name': event, 'source': 'startup',
+                'reason': 'clear', 'agent_id': 'child', 'agent_type': 'worker',
+                'prompt': 'PRIVATE PROMPT', 'transcript_path': '/private/transcript',
+                'headers': {'Authorization': 'PRIVATE HEADER'}})
+            meta = project('hook', hook, 'r')['unmapped']['traceward']
+            self.assertEqual(meta['hook_event'], event)
+            self.assertEqual(meta['hook_metadata']['source'], 'startup')
+            self.assertEqual(meta['hook_metadata']['agent_id'], 'child')
+            self.assertNotIn('PRIVATE', json.dumps(meta))
+            self.assertNotIn('/private/transcript', json.dumps(meta))
+
+    def test_stop_hooks_return_neutral_json_even_when_evidence_write_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for event in ('Stop', 'SubagentStop'):
+                result = subprocess.run([sys.executable, '-m', 'traceward.hook_sink'],
+                    input=json.dumps({'hook_event_name': event}), capture_output=True, text=True,
+                    env=dict(os.environ, TRACEWARD_HOOK_FILE=str(Path(directory) / 'missing' / 'hooks.jsonl')))
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(json.loads(result.stdout), {})
+
     def test_codex_flags_are_forwarded_verbatim_after_agent_name(self):
         options = _parse_run(['--runner-image','runner:v1','--workspace','/workspace',
                               'codex','exec','--config','model="example"','two words'])
@@ -44,11 +83,13 @@ class RuntimeTests(unittest.TestCase):
             with patch('traceward.runtime.Path.cwd',return_value=workspace), \
                  patch('traceward.runtime.ensure_image',return_value={'Id':'sha256:test','Architecture':'arm64'}), \
                  patch.dict(os.environ, {'CODEX_HOME':str(home),'TRACEWARD_MANAGED_RUNNER':'0',
-                                        'TRACEWARD_JUDGE_TOKEN':'NEVER_FORWARD','TRACEWARD_ENV_FILE':str(root/'observer.env')}):
+                                        'TRACEWARD_JUDGE_TOKEN':'NEVER_FORWARD','OPENROUTER_KEY':'NEVER_FORWARD',
+                                        'LMSTUDIO_API_KEY':'NEVER_FORWARD','TRACEWARD_ENV_FILE':str(root/'observer.env')}):
                 runtime = ManagedRuntime(run,'uuid',['exec','hello'],workspace=str(workspace))
             request = json.loads((run/'request.json').read_text())
             self.assertNotIn('NEVER_FORWARD', json.dumps(request))
-            self.assertNotIn('TRACEWARD_JUDGE_TOKEN', request['env'])
+            for key in ('TRACEWARD_JUDGE_TOKEN','OPENROUTER_KEY','LMSTUDIO_API_KEY'):
+                self.assertNotIn(key, request['env'])
             targets = [m[1] for m in request['guest_mounts']]
             self.assertNotIn('/observer-run', targets)
             self.assertIn('/traceward-hooks/hooks.jsonl', targets)

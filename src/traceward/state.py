@@ -76,6 +76,7 @@ class StateObserver:
         self.workspace, self.mode = workspace.resolve(), mode
         self.gaps: list[str] = []
         self.baseline: dict[str, dict] = {}
+        self.sampled_versions = {}
 
     def scan(self) -> dict[str, dict]:
         result, total = {}, 0
@@ -146,6 +147,17 @@ class StateObserver:
         return {'kind': 'file_state', 'time': time.time(), 'source': 'host_state',
                 'trust': 'independent_observation', 'phase': phase,
                 **{k: v for k, v in item.items() if not k.startswith('_')}}
+
+    def sample(self) -> list[dict]:
+        observations = self.end()
+        changed = []
+        for event in observations:
+            version = tuple(event.get(k) for k in ('sha256','size','mode','device','inode','mtime_ns','change'))
+            if self.sampled_versions.get(event['path']) != version:
+                self.sampled_versions[event['path']] = version
+                if event.get('change'):
+                    changed.append({**event,'phase':'live'})
+        return changed
 
     def end(self) -> list[dict]:
         final, events = self.scan(), []

@@ -1,5 +1,5 @@
 # Optional observer-side TLS inspection. No CA key or proxy runs in the guest.
-ARG PI_BASE_IMAGE=traceward-pi:0.85.1-lab3
+ARG PI_BASE_IMAGE=traceward-pi:0.85.1-lab4
 FROM ${PI_BASE_IMAGE}
 ENV UV_PYTHON_INSTALL_DIR=/opt/inspection-python \
     UV_TOOL_DIR=/opt/inspection-tools \

@@ -1,0 +1,180 @@
+diff --git a/pkg/sentry/seccheck/metadata.go b/pkg/sentry/seccheck/metadata.go
+index 3484e34..ddbbf74 100644
+--- a/pkg/sentry/seccheck/metadata.go
++++ b/pkg/sentry/seccheck/metadata.go
+@@ -31,6 +31,7 @@ const (
+ 	PointExitNotifyParent
+ 	PointTaskExit
+ 	PointMmap
++	PointFileDelete
+ 
+ 	// Add new Points above this line.
+ 	pointLengthBeforeSyscalls
+@@ -333,6 +334,11 @@ func genericInit() {
+ 		Name:          "sentry/task_exit",
+ 		ContextFields: defaultContextFields,
+ 	})
++	registerPoint(PointDesc{
++        ID: PointFileDelete,
++        Name: "sentry/file_delete",
++        ContextFields: defaultContextFields,
++    })
+ 	registerPoint(PointDesc{
+ 		ID:            PointMmap,
+ 		Name:          "sentry/mmap",
+diff --git a/pkg/sentry/seccheck/points/common.proto b/pkg/sentry/seccheck/points/common.proto
+index 546e589..4be8f77 100644
+--- a/pkg/sentry/seccheck/points/common.proto
++++ b/pkg/sentry/seccheck/points/common.proto
+@@ -166,5 +166,6 @@ enum MessageType {
+   MESSAGE_SYSCALL_MMAP = 36;
+   MESSAGE_SYSCALL_LISTEN = 37;
+   MESSAGE_SYSCALL_PTRACE = 38;
++  MESSAGE_SENTRY_FILE_DELETE = 39;
+ }
+ // LINT.ThenChange(../../../../examples/seccheck/server.cc)
+diff --git a/pkg/sentry/seccheck/points/syscall.proto b/pkg/sentry/seccheck/points/syscall.proto
+index 4694025..ef0ddd1 100644
+--- a/pkg/sentry/seccheck/points/syscall.proto
++++ b/pkg/sentry/seccheck/points/syscall.proto
+@@ -460,3 +460,18 @@ message Ptrace {
+   int64 request = 4;
+   int32 pid = 5;
+ }
++
++// FileDelete reports the actual pathname consumed by a deletion operation.
++// Pathname and start_path are captured before VFS mutation, not copied from a
++// userspace pointer at syscall exit. It reports directory-entry removal only.
++message FileDelete {
++  gvisor.common.ContextData context_data = 1;
++  Exit exit = 2;
++  uint64 sysno = 3;
++  int64 dirfd = 4;
++  string pathname = 5;
++  string start_path = 6;
++  uint32 flags = 7;
++  bool directory = 8;
++  string path_error = 9;
++}
+diff --git a/pkg/sentry/syscalls/linux/sys_file.go b/pkg/sentry/syscalls/linux/sys_file.go
+index ae05b09..23648db 100644
+--- a/pkg/sentry/syscalls/linux/sys_file.go
++++ b/pkg/sentry/syscalls/linux/sys_file.go
+@@ -29,6 +29,8 @@ import (
+ 	"gvisor.dev/gvisor/pkg/sentry/kernel/fasync"
+ 	"gvisor.dev/gvisor/pkg/sentry/kernel/pipe"
+ 	"gvisor.dev/gvisor/pkg/sentry/limits"
++"gvisor.dev/gvisor/pkg/sentry/seccheck"
++pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
+ 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+ )
+ 
+@@ -1061,21 +1063,7 @@ func mkdirat(t *kernel.Task, dirfd int32, addr hostarch.Addr, mode uint) error {
+ 
+ // Rmdir implements Linux syscall rmdir(2).
+ func Rmdir(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+-	pathAddr := args[0].Pointer()
+-	return 0, nil, rmdirat(t, linux.AT_FDCWD, pathAddr)
+-}
+-
+-func rmdirat(t *kernel.Task, dirfd int32, pathAddr hostarch.Addr) error {
+-	path, err := copyInPath(t, pathAddr)
+-	if err != nil {
+-		return err
+-	}
+-	tpop, err := getTaskPathOperation(t, dirfd, path, disallowEmptyPath, nofollowFinalSymlink, 0)
+-	if err != nil {
+-		return err
+-	}
+-	defer tpop.Release(t)
+-	return t.Kernel().VFS().RmdirAt(t, t.Credentials(), &tpop.pop)
++    return 0, nil, tracewardDeleteAt(t, sysno, linux.AT_FDCWD, args[0].Pointer(), 0, true)
+ }
+ 
+ // Symlink implements Linux syscall symlink(2).
+@@ -1215,37 +1203,58 @@ func readlinkat(t *kernel.Task, dirfd int32, pathAddr, bufAddr hostarch.Addr, si
+ 
+ // Unlink implements Linux syscall unlink(2).
+ func Unlink(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+-	pathAddr := args[0].Pointer()
+-	return 0, nil, unlinkat(t, linux.AT_FDCWD, pathAddr)
+-}
+-
+-func unlinkat(t *kernel.Task, dirfd int32, pathAddr hostarch.Addr) error {
+-	path, err := copyInPath(t, pathAddr)
+-	if err != nil {
+-		return err
+-	}
+-	tpop, err := getTaskPathOperation(t, dirfd, path, disallowEmptyPath, nofollowFinalSymlink, 0)
+-	if err != nil {
+-		return err
+-	}
+-	defer tpop.Release(t)
+-	return t.Kernel().VFS().UnlinkAt(t, t.Credentials(), &tpop.pop)
++    return 0, nil, tracewardDeleteAt(t, sysno, linux.AT_FDCWD, args[0].Pointer(), 0, false)
+ }
+ 
+ // Unlinkat implements Linux syscall unlinkat(2).
+ func Unlinkat(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+-	dirfd := args[0].Int()
+-	pathAddr := args[1].Pointer()
+-	flags := args[2].Int()
+-
+-	if flags&^linux.AT_REMOVEDIR != 0 {
+-		return 0, nil, linuxerr.EINVAL
+-	}
+-
+-	if flags&linux.AT_REMOVEDIR != 0 {
+-		return 0, nil, rmdirat(t, dirfd, pathAddr)
+-	}
+-	return 0, nil, unlinkat(t, dirfd, pathAddr)
++    flags := args[2].Int()
++    return 0, nil, tracewardDeleteAt(t, sysno, args[0].Int(), args[1].Pointer(), flags, flags & linux.AT_REMOVEDIR != 0)
++}
++
++// tracewardDeleteAt records immutable kernel-consumed arguments and observes
++// the result without using a sink's return value to change syscall behaviour.
++func tracewardDeleteAt(t *kernel.Task, sysno uintptr, dirfd int32, addr hostarch.Addr, flags int32, directory bool) (err error) {
++    var event *pb.FileDelete
++    var fields seccheck.FieldSet
++    if seccheck.Global.Enabled(seccheck.PointFileDelete) {
++        fields = seccheck.Global.GetFieldSet(seccheck.PointFileDelete)
++        ctx := &pb.ContextData{}
++        kernel.LoadSeccheckData(t, fields.Context, ctx)
++        event = &pb.FileDelete{ContextData: ctx, Sysno: uint64(sysno), Dirfd: int64(dirfd), Flags: uint32(flags), Directory: directory}
++        defer func() {
++            event.Exit = &pb.Exit{}
++            if err != nil {
++                event.Exit.Result = -1
++                event.Exit.Errorno = int64(kernel.ExtractErrno(err, int(sysno)))
++            }
++            seccheck.Global.SentToSinks(func(sink seccheck.Sink) error {
++                return sink.Syscall(t, fields, ctx, pb.MessageType_MESSAGE_SENTRY_FILE_DELETE, event)
++            })
++        }()
++    }
++    if flags & ^linux.AT_REMOVEDIR != 0 {
++        if event != nil { event.PathError = "invalid deletion flags" }
++        return linuxerr.EINVAL
++    }
++    path, err := copyInPath(t, addr)
++    if err != nil {
++        if event != nil { event.PathError = "pathname unavailable" }
++        return err
++    }
++    if event != nil { event.Pathname = path.String() }
++    tpop, err := getTaskPathOperation(t, dirfd, path, disallowEmptyPath, nofollowFinalSymlink, 0)
++    if err != nil {
++        if event != nil { event.PathError = "start directory unavailable" }
++        return err
++    }
++    defer tpop.Release(t)
++    if event != nil {
++        base, pathErr := t.Kernel().VFS().PathnameWithDeleted(t, tpop.pop.Root, tpop.pop.Start)
++        if pathErr == nil { event.StartPath = base } else { event.PathError = "start directory path unresolved" }
++    }
++    if directory { return t.Kernel().VFS().RmdirAt(t, t.Credentials(), &tpop.pop) }
++    return t.Kernel().VFS().UnlinkAt(t, t.Credentials(), &tpop.pop)
+ }
+ 
+ func setstatat(t *kernel.Task, dirfd int32, path fspath.Path, emptyPathCheck shouldAllowEmptyPathType, shouldFollowFinalSymlink shouldFollowFinalSymlink, opts *vfs.SetStatOptions) error {

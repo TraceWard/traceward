@@ -99,7 +99,7 @@ export ACTOR_URL='http://127.0.0.1:1234/v1/chat/completions'
 export JUDGE_URL='http://127.0.0.1:1234/v1/chat/completions'
 ```
 
-These examples explicitly select the model settings. For the current OpenAI-compatible judge adapter, the provider flag is `lmstudio`. The model server runs on the host; the example agent reaches its selected endpoint through a restricted relay.
+These examples explicitly select the model settings. The judge provider can be `lmstudio` or `openrouter` (configured independently of the actor). In these examples, the actor model server runs on the host and the agent reaches it through a restricted relay.
 
 ### Run an example with Pi
 
@@ -147,12 +147,23 @@ In a separate terminal, from the repository root:
 .venv/bin/python -m traceward.cli dashboard
 ```
 
-Open [http://localhost:8765](http://localhost:8765). The dashboard reads captured runs from `~/.local/state/traceward/runs/` by default and can display existing evidence without Docker or a model server running. Below the run metrics, the dashboard shows a live stacked activity chart with counts by event type and adjustable time buckets. Highlighted finding windows link to their findings; the chart and pending analysis update while the agent runs. Live assessments use bounded rolling windows across the supported investigation types; new evidence is assessed while Pi remains open. Model latency still applies; exiting Pi is not required. Keep the terminal open while using it; press `Ctrl+C` to stop the dashboard. Installing `.[dashboard]` above includes both FastAPI and `uvicorn`.
+Open [http://localhost:8765](http://localhost:8765). The dashboard reads captured runs from `~/.local/state/traceward/runs/` by default and can display existing evidence without Docker or a model server running. Below the run metrics, the dashboard shows a live stacked activity chart with counts by event type and adjustable time buckets. Highlighted finding windows link to their findings; the chart and pending analysis update while the agent runs. Live assessments use bounded rolling windows across the supported investigation types; new evidence is assessed while Pi remains open. Detailed assessments run during execution and rerun when relevant evidence changes. Normal live shutdown starts no extra model pass and does not wait for outstanding inference; unfinished evidence is saved as pending with earlier findings retained. Model latency still applies, and short sessions may end before an assessment completes. Explicit `--defer-judge` remains available when complete deferred analysis is preferred. Keep the terminal open while using it; press `Ctrl+C` to stop the dashboard. Installing `.[dashboard]` above includes both FastAPI and `uvicorn`.
 
 ### Current implementation and limits
 
-The current runtime backend uses managed gVisor inside Docker to collect selected Linux process, filesystem and network events. Correlation, host state observation and the judge client run on the invoking host. Agent-independent operation is the product goal; available integrations and tested runtime configurations currently determine coverage. Universal agent and platform support is not yet implemented.
+The current runtime backend uses managed gVisor inside Docker to collect selected Linux process, filesystem and network events. The pinned runtime includes an observation-only deletion patch, so successful file and directory removals can be assessed even when transient files are absent from both state snapshots. Collector finalization and cancelled reassessments are reported separately from model availability; see [runtime operations](docs/runtime.md#deletion-evidence-and-finalization). Correlation, host state observation and the judge client run on the invoking host. Agent-independent operation is the product goal; available integrations and tested runtime configurations currently determine coverage. Universal agent and platform support is not yet implemented.
 
 Runtime metadata does not prove which bytes were transmitted, and correlation does not prove an agent's hidden intent. Unsupported operations, missing signals, bounded context and model errors can leave behaviour undetected or misinterpreted. Redacted content capture is opt-in, and local evidence is not tamper-proof against the same host user. Known evaluation results are developmental evidence, not measured production accuracy. **No finding is not proof of safety.**
 
 See the [runtime setup and operations guide](docs/runtime.md) for installation, supported configurations, privacy and commands. The [validation record](VALIDATION.md) documents measured outcomes and remaining gaps, and the [demonstration guide](DEMO.md) explains reproducible examples.
+
+### Judge providers
+
+Choose the observer judge in the checkout `.env` or process environment. Existing process values win; `--judge-provider`, `--judge-model` and LM Studio's `--judge-url` override matching settings.
+
+| Provider | Model | Endpoint | Credential |
+| --- | --- | --- | --- |
+| `lmstudio` (default) | `TRACEWARD_JUDGE_MODEL` (default `qwen/qwen3.8-27b`) | `TRACEWARD_JUDGE_URL` (default local port 1234) | Optional `LMSTUDIO_API_KEY` |
+| `openrouter` | Required `TRACEWARD_JUDGE_MODEL`, using your OpenRouter model ID | Fixed `https://openrouter.ai/api/v1/chat/completions` | Required `OPENROUTER_KEY` |
+
+OpenRouter enables reasoning and requests strict structured output from compatible endpoints. Its selected model must support those parameters; responses still pass TraceWard's schema, model-identity and evidence checks. Unlike local LM Studio, selecting OpenRouter sends the bounded assessment evidence to OpenRouter and its serving provider. Judge credentials are excluded from the agent environment, request audit and saved responses. The older `TRACEWARD_JUDGE_TOKEN` remains an LM Studio compatibility alias; `LMSTUDIO_API_KEY` takes precedence. See [.env.example](.env.example) and [runtime settings](docs/runtime.md).

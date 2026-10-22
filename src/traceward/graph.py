@@ -34,6 +34,7 @@ class EvidenceGraph:
     def add(self, item: dict):
         allowed = {'event_id', 'kind', 'time', 'source', 'trust', 'role', 'pid', 'parent_pid', 'process_key',
             'parent_process_key', 'process_start_time_ns', 'sandbox_id', 'name', 'path', 'endpoint', 'bytes',
+            'pathname', 'start_path', 'dirfd', 'flags', 'directory', 'path_error', 'syscall',
             'operation_status', 'errno', 'result', 'syscall_number', 'raw_trace_ref', 'script_paths',
             'tool_use_id', 'tool_name', 'native_tool_name', 'event', 'command', 'file_targets', 'agent_pid',
             'cwd', 'session_id', 'turn_id', 'result_status', 'result_exit_code', 'response_sha256',
@@ -45,7 +46,7 @@ class EvidenceGraph:
             'passed', 'exit_code', 'validator_sha256', 'isolation', 'upstream_run_id', 'upstream_event_id',
             'upstream_record_sha256', 'origin_kind', 'path_resolution', 'origin_event_id', 'goal_at_collection',
             'method', 'url', 'scheme', 'http_version', 'status_code', 'headers', 'response_headers',
-            'request_body', 'response_body', 'client_address', 'error'}
+            'request_body', 'response_body', 'client_address', 'error', 'duplicate_state_of'}
         exported = {k: v for k, v in item.items() if k in allowed}
         from .privacy import redact
         def scrub(value):
@@ -107,7 +108,7 @@ class EvidenceGraph:
         with self.lock:
             current = self.db.execute('SELECT payload FROM observations WHERE run_id=? ORDER BY time,id',
                                       (self.run_id,)).fetchall()
-            events = [json.loads(row[0]) for row in current]
+            events = [e for row in current if not (e := json.loads(row[0])).get('duplicate_state_of')]
             sampled_paths = {e.get('path') for e in events if e['kind']=='file_state'}
             # Repeated interpreter/package loads are not artifact hand-offs.
             # Cross-tool path associations target sampled workspace resources.

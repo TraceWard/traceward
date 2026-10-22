@@ -10,6 +10,7 @@ import uuid
 from pathlib import Path
 
 from traceward.dashboard import RunIndex, create_app
+from traceward.ocsf import EvidenceStore
 
 try:
     from fastapi.testclient import TestClient
@@ -19,6 +20,58 @@ except ImportError:
 
 @unittest.skipIf(TestClient is None, "install dashboard optional dependencies")
 class DashboardTests(unittest.TestCase):
+    def test_retained_verdict_and_observed_telemetry_survive_cancelled_final_review(self):
+        store=EvidenceStore(self.run_dir,self.run_id)
+        store.event('file_delete',dict(event_id='delete',time=100,pid=2,path='/workspace/empty',source='gvisor',operation_status='succeeded'))
+        prior=dict(finding_id='f',revision=1,time=101,title='Deletion',message='Observed removal',
+            status='review_required',is_alert=True,evidence_ids=['delete'],consequential_evidence_ids=['delete'],
+            judge={'status':'assessed','model':'qwen-test','rationale':'Observed removal','cited_evidence_ids':['delete']})
+        store.assessment(prior)
+        store.assessment({**prior,'revision':2,'retained_review_revision':1,
+            'judge':{'status':'unavailable','reason':'assessment_cancelled_on_shutdown'}})
+        summary=dict(assessment_wait_cancelled=True,coverage_gaps=['gVisor telemetry was not established; run coverage is incomplete'])
+        (self.run_dir/'summary.json').write_text(json.dumps(summary))
+        before={f.name:f.read_bytes() for f in self.run_dir.iterdir() if f.is_file()}
+        run=self.client.get(f'/api/runs/{self.run_id}').json()
+        self.assertEqual(run['evaluation_label'],'Assessed · final review cancelled')
+        self.assertTrue(run['analysis_incomplete'])
+        self.assertTrue(run['telemetry_status']['trace_established'])
+        self.assertFalse(run['telemetry_status']['finalized'])
+        self.assertNotIn('was not established',' '.join(run['summary']['coverage_gaps']))
+        finding=self.client.get(f'/api/runs/{self.run_id}/findings').json()['findings'][0]
+        self.assertEqual(finding['judge']['reason'],'assessment_cancelled_on_shutdown')
+        self.assertEqual(finding['effective_judge'],prior['judge'])
+        self.assertEqual(finding['effective_judge_revision'],1)
+        self.assertEqual(finding['assessment_attempt_status'],'cancelled')
+        self.assertEqual(self.client.get(f'/api/runs/{self.run_id}/events?kind=file_delete').json()['events'][0]['metadata']['uid'],'delete')
+        self.assertEqual(before,{f.name:f.read_bytes() for f in self.run_dir.iterdir() if f.is_file()})
+        store.assessment({**prior,'revision':3,'retained_review_revision':1,
+            'judge':{'status':'unavailable','reason':'connection_failed'}})
+        run=self.client.get(f'/api/runs/{self.run_id}').json()
+        self.assertEqual(run['evaluation_label'],'Earlier assessment retained · latest assessment unavailable')
+        finding=self.client.get(f'/api/runs/{self.run_id}/findings').json()['findings'][0]
+        self.assertEqual(finding['assessment_attempt_status'],'unavailable')
+        self.assertEqual(finding['effective_judge'],prior['judge'])
+
+    def test_hook_filter_finds_early_lifecycle_events_and_paginates_by_name(self):
+        store = EvidenceStore(self.run_dir, self.run_id)
+        for i, name in enumerate(('SessionStart', 'PreToolUse', 'PostToolUse', 'Stop', 'SessionEnd')):
+            store.event('hook', {'event_id': f'h{i}', 'event': name, 'time': i,
+                                'hook_metadata': {'reason': 'quit'}})
+        for i in range(300):
+            store.event('file_read', {'event_id': f'f{i}', 'time': i+10, 'pid': 1, 'path': '/workspace/app.py'})
+        url = f'/api/runs/{self.run_id}/events'
+        self.assertFalse(any(e['class_uid'] == 0 for e in self.client.get(url).json()['events']))
+        first = self.client.get(url + '?kind=hook&limit=2').json()
+        self.assertEqual([e['metadata']['uid'] for e in first['events']], ['h3', 'h4'])
+        self.assertEqual(set(first['hook_events']), {'SessionStart', 'PreToolUse', 'PostToolUse', 'Stop', 'SessionEnd'})
+        second = self.client.get(url + f"?kind=hook&limit=2&before={first['next_before']}").json()
+        self.assertEqual([e['metadata']['uid'] for e in second['events']], ['h1', 'h2'])
+        selected = self.client.get(url + '?kind=hook&hook_event=SessionStart').json()
+        self.assertEqual([e['metadata']['uid'] for e in selected['events']], ['h0'])
+        self.assertEqual(selected['events'][0]['unmapped']['traceward']['hook_metadata']['reason'], 'quit')
+        self.assertEqual(self.client.get(url + '?kind=hook&hook_event=missing').json()['events'], [])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

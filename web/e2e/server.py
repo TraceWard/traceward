@@ -35,6 +35,57 @@ for i in range(30):
   (extra/'summary.json').write_text(json.dumps({'codex_exit_code': 0}))
 index = RunIndex(runs,root/'index.sqlite')
 app = create_app(index,Path(__file__).resolve().parents[2]/'src/traceward/dashboard_assets')
+@app.post('/test/deletion-report/{mode}')
+def deletion_report(mode: str):
+ identity={'retained':'55555555-5555-4555-8555-555555555551',
+           'cancelled':'55555555-5555-4555-8555-555555555552',
+           'outage':'55555555-5555-4555-8555-555555555553',
+           'pending':'55555555-5555-4555-8555-555555555554',
+           'retained-pending':'55555555-5555-4555-8555-555555555555'}[mode]
+ destination=runs/identity;destination.mkdir(mode=0o700,exist_ok=True)
+ (destination/'run.json').write_text(json.dumps({'goal':'Read-only; no deletions','started_at':time.time(),
+   'source':'scripted_agent','observer_version':'gvisor-v1'}))
+ ledger=EvidenceStore(destination,identity)
+ ledger.event('file_delete',dict(event_id='deleted-empty',time=100,pid=4,source='gvisor',path='/workspace/empty.txt',
+   syscall='unlinkat',operation_status='succeeded',path_resolution='kernel-consumed pathname and captured start'))
+ concern=dict(finding_id='deletion',revision=1,time=101,title='Deleted empty.txt',message='Synthetic removal under a read-only goal',
+   status='review_required',is_alert=True,attribution='command-and-process-lineage',evidence_ids=['deleted-empty'],
+   consequential_evidence_ids=['deleted-empty'],observed_effects=['file_delete'],counterevidence=[],coverage_gaps=[],
+   judge=dict(status='assessed',model='qwen-synthetic-browser',disposition='review_required',
+              rationale='Synthetic directory-entry removal conflicts with the read-only goal.',cited_evidence_ids=['deleted-empty']))
+ if mode in {'retained','retained-pending'}:ledger.assessment(concern)
+ ledger.assessment({**concern,'revision':2,'status':'review_required' if mode in {'retained','retained-pending'} else 'assessment_pending' if mode=='pending' else 'evaluation_unavailable',
+   **({'retained_review_revision':1} if mode in {'retained','retained-pending'} else {}),
+   'judge':({'status':'pending','reason':'session_ended_before_assessment'} if 'pending' in mode else
+            {'status':'unavailable','reason':'connection_failed' if mode=='outage' else 'assessment_cancelled_on_shutdown'})})
+ (destination/'summary.json').write_text(json.dumps({'assessment_wait_cancelled':mode!='outage','final_review_complete':False,
+   'coverage_gaps':['gVisor telemetry was not established; run coverage is incomplete'],
+   **({'assessment_mode':'realtime','pending_assessment_count':1,'assessment_wait_cancelled':False} if 'pending' in mode else {})}))
+ return {'run_id':identity}
+
+@app.post('/test/hooks')
+def lifecycle_hooks():
+ hook_id = '44444444-4444-4444-8444-444444444444'
+ hook_folder = runs / hook_id
+ hook_folder.mkdir(mode=0o700, exist_ok=True)
+ (hook_folder/'run.json').write_text(json.dumps({'goal':'Synthetic lifecycle visibility',
+   'started_at':time.time(), 'heartbeat_at':time.time(), 'source':'pi', 'observer_version':'gvisor-v1'}))
+ hook_store = EvidenceStore(hook_folder, hook_id)
+ names = [('SessionStart','session_start'), ('AgentStart','agent_start'), ('TurnStart','turn_start'),
+          ('PreToolUse','tool_call'), ('PostToolUse','tool_execution_end'), ('AgentEnd','agent_end'),
+          ('SessionShutdown','session_shutdown')]
+ for i, (name, native) in enumerate(names):
+  hook_store.event('hook', {'event_id':f'lifecycle-{i}', 'time':100+i, 'source':'pi_extension',
+    'event':name, 'native_event':native, 'session_id':'synthetic-session', 'turn_id':'0',
+    'tool_name':'Bash' if 'ToolUse' in name else None,
+    'command':'npm test' if name=='PreToolUse' else '',
+    'result_status':'ok' if name=='PostToolUse' else None, 'hook_metadata':{'reason':'startup' if i==0 else 'quit'}})
+ for i in range(300):
+  hook_store.event('file_read', {'event_id':f'lifecycle-file-{i}', 'time':200+i, 'pid':1, 'path':'/workspace/app.py'})
+ # A selected finding with just a pre-tool citation must not limit Hooks only.
+ hook_store.finding({**base, 'finding_id':'hook-review', 'status':'review_required', 'evidence_ids':['lifecycle-3']})
+ return {'run_id':hook_id}
+
 @app.post('/test/live/{phase}')
 def live(phase: str):
  live_id='33333333-3333-4333-8333-333333333333'

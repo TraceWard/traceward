@@ -14,7 +14,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .cli import state_root
-from .records import assessment_record
+from .records import assessment_record, effective_assessment
+from .collector_status import describe_status
 
 
 def _run_id(value: str) -> str:
@@ -47,7 +48,7 @@ def _kind(event: dict) -> str:
     if uid == 0:
         return "hook" if traceward.get("hook_event") else "coverage"
     if uid == 1001:
-        return {14: "file_open", 2: "file_read", 3: "file_write"}.get(activity, "file")
+        return {14: "file_open", 2: "file_read", 3: "file_write", 4: "file_delete"}.get(activity, "file")
     if uid == 1007:
         return "process"
     if uid == 4001:
@@ -204,20 +205,38 @@ class RunIndex:
         reviews = [f for f in assessments if f.get('status') == 'review_required']
         review_count = len(reviews)
         finding_title = reviews[0]['title'] if reviews else None
+        cancelled = any(f['assessment_attempt_status'] == 'cancelled' for f in assessments)
+        effective = [f.get('effective_judge') for f in assessments]
         if not assessments:
-            evaluation_label = "No consequential episode assessed"
-        elif any("demo" in f.get("judge", {}).get("model", "") or f.get("judge", {}).get("evaluation_source") == "simulated" for f in assessments):
-            evaluation_label = "Simulated evaluator · not a model assessment"
-        elif all(f.get("judge", {}).get("status") in {"scored", "assessed"} for f in assessments):
-            evaluation_label = "Model assessed"
-        elif any(f.get("judge", {}).get("status") == "unavailable" for f in assessments):
-            evaluation_label = "Model unavailable"
+            evaluation_label = 'No consequential episode assessed'
+        elif any(j and ('demo' in j.get('model', '') or j.get('evaluation_source') == 'simulated') for j in effective):
+            evaluation_label = 'Simulated evaluator · not a model assessment'
+        elif cancelled:
+            evaluation_label = 'Assessed · final review cancelled' if any(effective) else 'Assessment cancelled'
+        elif summary and summary.get('assessment_mode') == 'realtime' and summary.get('pending_assessment_count'):
+            evaluation_label = 'Assessed · additional evidence pending' if any(effective) else 'Assessment pending · session ended'
+        elif all(f['assessment_attempt_status'] == 'assessed' for f in assessments):
+            evaluation_label = 'Model assessed'
+        elif any(f.get('retained_review_revision') and f.get('effective_judge') for f in assessments):
+            evaluation_label = 'Earlier assessment retained · latest assessment unavailable'
+        elif any(f['assessment_attempt_status'] == 'unavailable' for f in assessments):
+            evaluation_label = 'Partly assessed · some assessments unavailable' if any(effective) else 'Model unavailable'
         else:
-            evaluation_label = "Assessment pending"
+            evaluation_label = 'Partly assessed · assessments pending' if any(effective) else 'Assessment pending'
+        observed = self.db.execute("SELECT COUNT(*) FROM events WHERE run_id=? AND source='gvisor' AND kind!='coverage'", (row['run_id'],)).fetchone()[0]
+        telemetry = (summary or {}).get('telemetry_status') or describe_status(summary or {}, observed)
+        if summary and telemetry['trace_established'] and not telemetry['finalized']:
+            original_gaps = summary.get('coverage_gaps', [])
+            misleading = 'gVisor telemetry was not established; run coverage is incomplete'
+            if misleading in original_gaps:
+                summary = {**summary, 'source_coverage_gaps': original_gaps,
+                    'coverage_gaps': [telemetry['message'] if gap == misleading else gap for gap in original_gaps]}
+        analysis_incomplete = bool(summary and (summary.get('final_review_complete') is False
+            or summary.get('assessment_wait_cancelled') or any(f['assessment_attempt_status'] in {'cancelled', 'unavailable', 'pending'} for f in assessments)))
         return {"run_id": row["run_id"], "name": manifest.get("name") or manifest.get("run_name"),
                 "goal": manifest.get("goal") or (summary or {}).get("goal") or "Goal unavailable",
                 "started_at": manifest.get("started_at") or row["updated_at"], "updated_at": row["updated_at"],
-                "status": status, "summary": summary, "event_counts": {r["kind"]: r["n"] for r in counts},
+                "status": status, "summary": summary, "telemetry_status": telemetry, "analysis_incomplete": analysis_incomplete, "event_counts": {r["kind"]: r["n"] for r in counts},
                 "finding_count": review_count, "assessment_count": len(assessments), "finding_title": finding_title,
                 "review_count": review_count, "evaluation_label": evaluation_label,
                 "source": manifest.get("source", "unknown"), "demo_case": manifest.get("demo_case"),
@@ -235,7 +254,8 @@ class RunIndex:
             return self._public_run(row) if row else None
 
     def events(self, run_id: str, *, before: int | None = None, limit: int = 250,
-               kind: str | None = None, source: str | None = None, pid: int | None = None) -> dict:
+               kind: str | None = None, source: str | None = None, pid: int | None = None,
+               hook_event: str | None = None) -> dict:
         with self.lock:
             query = "SELECT id,body FROM events WHERE run_id=?"
             values: list = [_run_id(run_id)]
@@ -250,14 +270,22 @@ class RunIndex:
                 if value is not None:
                     query += " AND " + clause
                     values.append(value)
+            if hook_event is not None:
+                query += " AND kind='hook' AND json_extract(body,'$.unmapped.traceward.hook_event')=?"
+                values.append(hook_event)
             query += " ORDER BY COALESCE(time_ms,0) DESC,id DESC LIMIT ?"
             page_size = min(max(limit, 1), 500)
             values.append(page_size + 1)
             rows = self.db.execute(query, values).fetchall()
             has_more = len(rows) > page_size
             rows = rows[:page_size]
-            return {"events": [{"index_id": row["id"], **json.loads(row["body"])} for row in reversed(rows)],
-                    "next_before": rows[-1]["id"] if rows and has_more else None}
+            result = {"events": [{"index_id": row["id"], **json.loads(row["body"])} for row in reversed(rows)],
+                      "next_before": rows[-1]["id"] if rows and has_more else None}
+            if kind == 'hook' or hook_event is not None:
+                result['hook_events'] = [row[0] for row in self.db.execute(
+                    "SELECT DISTINCT json_extract(body,'$.unmapped.traceward.hook_event') name "
+                    "FROM events WHERE run_id=? AND kind='hook' ORDER BY name", (run_id,)) if row[0]]
+            return result
 
     def assessments(self, run_id: str) -> list[dict]:
         with self.lock:
@@ -271,7 +299,7 @@ class RunIndex:
                 revisions = self.db.execute("""SELECT body FROM findings WHERE run_id=? AND finding_id=?
                   ORDER BY revision""", (run_id, finding["finding_id"])).fetchall()
                 finding["revisions"] = [assessment_record(json.loads(rev["body"])) for rev in revisions]
-                results.append(finding)
+                results.append(effective_assessment(finding, finding["revisions"]))
             return results
 
     def findings(self, run_id: str) -> list[dict]:
@@ -410,10 +438,11 @@ def create_app(index: RunIndex, assets: Path | None = None):
 
     @app.get("/api/runs/{run_id}/events")
     def events(run_id: str, before: int | None = None, limit: int = 250,
-               kind: str | None = None, source: str | None = None, pid: int | None = None):
+               kind: str | None = None, source: str | None = None, pid: int | None = None,
+               hook_event: str | None = None):
         index.refresh()
         required_run(run_id)
-        return index.events(run_id, before=before, limit=limit, kind=kind, source=source, pid=pid)
+        return index.events(run_id, before=before, limit=limit, kind=kind, source=source, pid=pid, hook_event=hook_event)
 
     @app.get("/api/runs/{run_id}/findings")
     def findings(run_id: str):

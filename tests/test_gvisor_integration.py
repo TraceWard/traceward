@@ -21,6 +21,62 @@ from traceward.runtime import ManagedRuntime
 
 @unittest.skipUnless(os.environ.get('TRACEWARD_TEST_DOCKER') == '1' and shutil.which('docker'), 'opt-in Docker runtime checks')
 class ManagedIntegrationTests(unittest.TestCase):
+    def test_live_transient_deletions_dirfd_symlinks_failures_and_directory_removal(self):
+        from traceward.state import StateObserver
+        (self.workspace/'target').touch()
+        states=StateObserver(self.workspace);states.begin()
+        command=['python3','-c', '''
+import os, subprocess
+from pathlib import Path
+Path('empty.txt').touch(); os.unlink('empty.txt')
+Path('directory').mkdir(); Path('directory/item').touch()
+fd=os.open('directory',os.O_RDONLY);os.unlink('item',dir_fd=fd);os.close(fd)
+os.symlink('target','link');os.unlink('link');assert Path('target').exists()
+os.rmdir('directory')
+try:os.unlink('missing')
+except FileNotFoundError:pass
+subprocess.run(['/bin/bash','-c','touch child; rm child'],check=True)
+''']
+        runtime=self.runtime(command)
+        result=subprocess.run(runtime.command,stdin=subprocess.DEVNULL,capture_output=True,text=True,timeout=45)
+        self.assertEqual(result.returncode,0,result.stderr)
+        status=json.loads((self.run/'runtime-status.json').read_text())
+        self.assertTrue(status['trace_established']);self.assertTrue(status['finalized'])
+        self.assertTrue(status['gvisor_patch']['patch_sha256'])
+        parser=GvisorParser(str(self.workspace),status['abi'])
+        deletions=[e for line in (self.run/'raw.gvisor.jsonl').read_text().splitlines()
+                   if (e:=parser.parse(line)) and e['kind']=='file_delete']
+        self.assertEqual(parser.unparsed,0)
+        by_name={Path(e['path']).relative_to(self.workspace).as_posix():e for e in deletions}
+        self.assertEqual(set(by_name),{'empty.txt','directory/item','link','directory','missing','child'})
+        self.assertEqual(by_name['missing']['operation_status'],'failed')
+        self.assertTrue(by_name['directory']['directory'])
+        self.assertEqual(by_name['directory/item']['dirfd']>=0,True)
+        self.assertTrue(all(e['operation_status']=='succeeded' for name,e in by_name.items() if name!='missing'))
+        self.assertFalse(any(e.get('change') for e in states.end()))
+
+    def test_repeated_signals_during_collector_drain_preserve_final_status(self):
+        runtime=self.runtime(['python3','-c','print("guest finished")'])
+        index=runtime.command.index(runtime.image)
+        injection=('import time;from pathlib import Path;from traceward import runner;'
+            'original=runner.Receiver.close;'
+            'runner.Receiver.close=lambda self:(Path("/observer-run/draining").touch(),time.sleep(1),original(self))[-1];'
+            'raise SystemExit(runner.supervise(Path("/observer-run/request.json")))')
+        child=subprocess.Popen(runtime.command[:index+1]+['-c',injection],stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        try:
+            deadline=time.monotonic()+15
+            while not (self.run/'draining').exists() and child.poll() is None and time.monotonic()<deadline:time.sleep(.02)
+            self.assertTrue((self.run/'draining').exists())
+            runtime.signal(child,signal.SIGINT);runtime.signal(child,signal.SIGTERM)
+            out,err=child.communicate(timeout=15)
+            self.assertEqual(child.returncode,0,err)
+            self.assertIn('guest finished',out)
+            status=json.loads((self.run/'runtime-status.json').read_text())
+            self.assertTrue(status['finalized']);self.assertTrue(status['trace_established'])
+        finally:
+            if child.poll() is None:child.kill();child.communicate()
+
     def setUp(self):
         directory=tempfile.TemporaryDirectory(prefix='traceward-runtime-test-')
         self.addCleanup(directory.cleanup)
@@ -122,6 +178,19 @@ class ManagedIntegrationTests(unittest.TestCase):
         status=json.loads((self.run/'runtime-status.json').read_text())
         self.assertTrue(status['collector_failed'])
         self.assertGreater(status['decode_errors'],0)
+
+    def test_status_persistence_failure_preserves_guest_exit(self):
+        runtime=self.runtime(['/bin/bash','-c','sleep 1.2; touch continued; exit 7'])
+        image_index=runtime.command.index(runtime.image)
+        injection=('from pathlib import Path;from traceward import runner;'
+            'runner.write_status=lambda *args,**kwargs:(_ for _ in ()).throw(OSError("synthetic status disk failure"));'
+            'raise SystemExit(runner.supervise(Path("/observer-run/request.json")))')
+        result=subprocess.run(runtime.command[:image_index+1]+['-c',injection],stdin=subprocess.DEVNULL,capture_output=True,text=True,timeout=45)
+        self.assertEqual(result.returncode,7,result.stderr)
+        self.assertTrue((self.workspace/'continued').exists())
+        self.assertFalse((self.run/'runtime-status.json').exists())
+        records=list(map(json.loads,(self.run/'raw.gvisor.jsonl').read_text().splitlines()))
+        self.assertEqual(sum('status persistence failed' in r.get('message','') for r in records),1)
 
     def test_exit_code(self):
         runtime=self.runtime(['/bin/bash','-c','exit 7'])

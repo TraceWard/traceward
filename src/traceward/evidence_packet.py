@@ -87,6 +87,10 @@ def model_input(evidence_packet: dict, *, max_state_bytes: int = MAX_STATE_BYTES
                 text += " " + e["operation_status"]
                 if e.get("errno"):
                     text += f" errno={e['errno']}"
+            if kind == 'file_delete':
+                text += ' directory entry removal' + (' (directory)' if e.get('directory') else '')
+                text += ' ' + str(e.get('path_resolution') or '')
+                if not e.get('path'): text += ' target unresolved'
             if e.get("byte_count") is not None:
                 total_bytes = sum(item.get("byte_count", 0) for item in group)
                 text += f" {total_bytes} bytes"
@@ -205,6 +209,9 @@ def packet(goal: str, finding: dict, observations: list[dict], coverage: list[st
             "byte_count": event.get("bytes"),
             "message_count": event.get("message_count"),
             "syscall": event.get("syscall"),
+            "path_resolution": event.get("path_resolution"),
+            "directory": event.get("directory"),
+            "pathname": redact(str(event.get("pathname", "")), 256),
             "operation_status": event.get("operation_status"),
             "errno": event.get("errno"),
             "result": event.get("result"),

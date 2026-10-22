@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import posixpath
 import re
 import threading
@@ -56,7 +57,7 @@ class Engine:
                  measure_latency: bool = True, evaluation_wait_seconds: float = 10, coverage_gaps: list[str] | None = None,
                  defer_evaluation: bool = False, workspace: str | None = None,
                  extended_analysis: bool = False, context_mode: str = 'metadata',
-                 graph_path=None, shared_roots=(), transport_endpoints=(), agent_state_roots=()):
+                 graph_path=None, shared_roots=(), transport_endpoints=(), agent_state_roots=(), realtime=False):
         self.goal, self.store = goal, store
         self.judge_fn = judge_fn
         self.judge_slots = threading.BoundedSemaphore(2)
@@ -64,6 +65,8 @@ class Engine:
         self.measure_latency = measure_latency
         self.evaluation_wait_seconds = evaluation_wait_seconds
         self.defer_evaluation = defer_evaluation
+        self.realtime_requested = realtime and extended_analysis
+        self.realtime = self.realtime_requested and not defer_evaluation
         self.live_windows = extended_analysis and not defer_evaluation
         self.window_seconds, self.window_stride_seconds = 30.0, 1.0
         self.last_reviews = {}
@@ -77,6 +80,8 @@ class Engine:
         self.graph = EvidenceGraph(graph_path or store.run_dir / 'evidence-graph.sqlite', store.run_id,
                                    shared_roots) if extended_analysis else None
         self.write_candidates: set[str] = set()
+        self.delete_candidates: set[str] = set()
+        self.delete_groups = {}
         self.parents: dict[int, int] = {}
         self.hooks: list[dict] = []
         self.post_hooks: dict[str, dict] = {}
@@ -85,7 +90,12 @@ class Engine:
         self.event_generation = 0
         self.finished = False
         self.assessments_cancelled = False
+        self.assessments_closed = False
+        self.state_versions = {}
+        self.graph_attributions = {}
+        self.pending_assessment_ids = set()
         self.final_assessments: set[str] = set()
+        self.assessment_states: dict[str, str] = {}
         self.last_arrival = time.monotonic()
         self.post_arrivals: dict[str, float] = {}
         self.execs: list[dict] = []
@@ -112,6 +122,7 @@ class Engine:
                 raise ValueError('the run goal is already established or empty')
             self.goal = goal
             self.defer_evaluation = defer_evaluation
+            self.realtime = self.realtime_requested and not defer_evaluation
             self.live_windows = self.extended_analysis and not defer_evaluation
             if len(goal) > 1000: self.add_gap('authorised goal truncated by bounded contract; authority context incomplete')
             self.event_generation += 1
@@ -122,15 +133,25 @@ class Engine:
             item = {**item, 'event_id': str(uuid.uuid4())}
             if item['kind'] in {'context', 'agent_claim'}:
                 item['trust'] = 'agent_claim' if item['kind'] == 'agent_claim' else 'lower_trust_content'
-            if item['kind'] == 'file_state': item['goal_at_collection'] = redact(self.goal, 1000)
+            duplicate_state = False
+            if item['kind'] == 'file_state':
+                item['goal_at_collection'] = redact(self.goal, 1000)
+                if self.realtime:
+                    fields = ('path','sha256','size','mode','device','inode','mtime_ns','resource_version',
+                              'integrity_predicates','diff_excerpt')
+                    version = ({k:item.get(k) for k in fields}, item.get('change') == 'deleted')
+                    prior = self.state_versions.get(item['path'])
+                    duplicate_state = bool(prior and prior[0] == version)
+                    if duplicate_state: item['duplicate_state_of'] = prior[1]
+                    else: self.state_versions[item['path']] = (version, item['event_id'])
             self.store.event(item['kind'], item)
             self.store.observations.append(item)
             self.semantic_events.append(item)
             self.counts[item['kind']] += 1
             if self.graph: self.graph.add(item)
-            if self.extended_analysis and item['kind'] == 'file_state' and item.get('change'):
+            if self.extended_analysis and item['kind'] == 'file_state' and item.get('change') and not duplicate_state:
                 matches = [(f, seed) for f, seed in self.candidate_seeds.values()
-                    if f.get('candidate_kind') == 'file_write' and any(e.get('path') == item['path'] for e in seed)]
+                    if (f.get('candidate_kind') == 'file_write' or f.get('candidate_kind') == 'file_delete' and item.get('change') == 'deleted') and any(e.get('path') == item['path'] for e in seed)]
                 if matches:
                     for f, _ in matches: self.state_updates.setdefault(f['finding_id'], []).append(item)
                 else:
@@ -225,7 +246,7 @@ class Engine:
             self.effects.append(created)
             self._link()
             return
-        if kind not in {"process", "process_exit", "file_open", "file_read", "file_write", "network", "network_send"}:
+        if kind not in {"process", "process_exit", "file_open", "file_read", "file_write", "network", "network_send", "file_delete"}:
             return
         item = {**item, "event_id": str(uuid.uuid4())}
         # raw_args is used only transiently for hook matching, never exported.
@@ -245,7 +266,9 @@ class Engine:
             if item.get("parent_pid") is not None:
                 self.parents[_key(item)] = item.get("parent_process_key") or item["parent_pid"]
             self._link()
-        if kind == "network_send":
+        if kind == "file_delete":
+            self._detect_file_delete(item)
+        elif kind == "network_send":
             self._detect_network(item)
         elif kind == "file_write":
             self._detect_file_write(item)
@@ -258,6 +281,16 @@ class Engine:
                     ['file_read'], [item], candidate_kind='shared_resource_access')
         elif self.extended_analysis and kind == 'network' and item.get('operation_status') == 'failed' and item.get('endpoint') not in {'', None, 'unresolved'}:
             self._detect_network(item, attempted=True)
+        if self.realtime: self._attribute_live(item)
+
+    def _attribute_live(self, event):
+        tid = self._tool_for(_key(event))
+        if not tid and event['kind'] in {'file_read','file_write'}:
+            matches = self._native_matches(event, completed=True)
+            if len(matches) == 1: tid = matches[0]['tool_use_id']
+        if event['event_id'] not in self.graph_attributions or self.graph_attributions[event['event_id']] != tid:
+            self.graph.attribute(event,tid)
+            self.graph_attributions[event['event_id']] = tid
 
     def _link(self) -> None:
         for hook in self.hooks:
@@ -283,10 +316,13 @@ class Engine:
                 self.links[_key(candidates[0])] = tool_id
         # A link may arrive after its file/network effects were parsed.
         for event in list(self.effects):
+            if self.realtime: self._attribute_live(event)
             if event.get("kind") == "network_send":
                 self._detect_network(event)
             elif event.get("kind") == "file_write":
                 self._detect_file_write(event)
+            elif event.get("kind") == "file_delete":
+                self._detect_file_delete(event)
 
     def _workspace_write(self, event: dict) -> bool:
         path = posixpath.normpath(event.get("path", ""))
@@ -423,6 +459,32 @@ class Engine:
                            title, message, [event["kind"] for event in observations], observations,
                            candidate_kind="file_write")
 
+    def _detect_file_delete(self, event: dict) -> None:
+        if event['event_id'] in self.delete_candidates:
+            return
+        tid = self._tool_for(_key(event))
+        path = event.get('path', '')
+        workspace = bool(self.workspace and path.startswith(self.workspace.rstrip('/') + '/'))
+        if not workspace and not (tid or _sensitive_path(path)):
+            return
+        if not tid and event.get('pid') == 1 and any(path.startswith(p) for p in self.agent_state_roots):
+            return
+        self.delete_candidates.add(event['event_id'])
+        group = ('file_delete', tid or f"{_key(event)}:{int(event['time'] // 30)}", event.get('operation_status', 'unknown'))
+        if group in self.delete_groups:
+            finding, seed = self.candidate_seeds[self.delete_groups[group]]
+            seed.append(event)
+            finding['consequential_evidence_ids'].append(event['event_id'])
+            return
+        failed = event.get('operation_status') == 'failed'
+        self._emit_finding(group, tid, event,
+            ('Failed deletion attempt: ' if failed else 'Directory entry removed: ') + redact(path or event.get('pathname') or 'unresolved target'),
+            ('Runtime recorded a failed deletion attempt; no successful removal is established.' if failed else
+             'Runtime recorded successful directory-entry removal, not destruction of all copies or file contents.'),
+            ['file_delete'], [event], candidate_kind='file_delete')
+        self.delete_groups[group] = next(fid for fid, (f, _) in self.candidate_seeds.items()
+            if event['event_id'] in f['consequential_evidence_ids'])
+
     @staticmethod
     def _apparent(hook: dict) -> str:
         return redact(hook.get("command") or f"{hook.get('tool_name', 'file tool')} "
@@ -556,7 +618,7 @@ class Engine:
                 for e in evidence if e['kind'] in {'file_read', 'file_write'})
         if ambiguous:
             gaps.append("hook-to-process attribution became ambiguous; do not rely on causal linkage" if hook
-                        else "No unique completed tool attribution for the observed write; runtime evidence retained")
+                        else "No unique completed tool attribution for the observed effect; runtime evidence retained")
         counter = []
         for e in evidence:
             if not write and e["kind"] == "file_write" and not _sensitive_path(e.get("path", "")):
@@ -629,7 +691,8 @@ class Engine:
                 'candidate_kind': updated.get('candidate_kind'),
                 'consequential_effects_only': True})
         if self.live_windows:
-            evidence_packet['live_window'] = not self.finished
+            evidence_packet['live_window'] = self.realtime or not self.finished
+            if self.realtime: evidence_packet['assessment_contract'] = 'goal-effects-live-v2'
             evidence_packet['analysis_window'] = {'start': window_start, 'end': window_end,
                 'duration_seconds': self.window_seconds, 'stride_seconds': self.window_stride_seconds,
                 'context_event_limit': 60, 'causal_context_carried': True,
@@ -693,10 +756,10 @@ class Engine:
             finding['attribution'] = 'host-observed-state' if kind == 'repository_state' else 'independent-check-and-agent-claim'
             finding['episode_complete'] = not omitted
             gaps = [g for g in gaps if not g.startswith(('PostToolUse missing', 'No unique completed tool attribution'))]
-        elif kind in {'sensitive_access', 'shared_resource_access', 'failed_attempt', 'network_effect'}:
+        elif kind in {'sensitive_access', 'shared_resource_access', 'failed_attempt', 'network_effect', 'file_delete'}:
             # Re-evaluate resource/window attribution after all hook messages arrived.
             effect = next((e for e in evidence if e['event_id'] in finding['consequential_evidence_ids']
-                           and e['kind'] in {'file_read', 'file_open', 'network_send', 'network'}), None)
+                           and e['kind'] in {'file_read', 'file_open', 'network_send', 'network', 'file_delete'}), None)
             if effect:
                 tid = self._tool_for(_key(effect))
                 matches = self._native_matches(effect, completed=True) if not tid and effect.get('path') else []
@@ -718,24 +781,22 @@ class Engine:
 
     def _enrich(self, finding: dict, seed: list[dict]) -> None:
         try:
+            with self.changed:
+                while not self.goal and self.defer_evaluation and not self.finished and not self.assessments_cancelled and not self.assessments_closed:
+                    self.changed.wait(.1)
+                if self.assessments_cancelled or self.assessments_closed: return
             if self.live_windows: self._rolling_assessment(finding, seed)
             else: self._enrich_episode(finding, seed)
         except Exception as exc:
             with self.changed:
-                if self.assessments_cancelled: return
+                if (self.assessments_cancelled or self.assessments_closed): return
                 # Never leave a silently orphaned provisional candidate after a
                 # packet/worker failure. The source evidence remains authoritative.
                 self.add_gap('assessment worker failed: ' + type(exc).__name__)
-                failed = {**finding, 'revision': self.assessed_packets.get(finding['finding_id'], (1, None))[0] + 1, 'time': time.time(),
-                          'status': 'evaluation_unavailable', 'is_alert': False,
-                          'coverage_gaps': [*self.coverage_gaps],
-                          'judge': {'status': 'unavailable', 'reason': 'assessment_worker_' + type(exc).__name__}}
-                if self.extended_analysis:
-                    self.store.assessment(failed)
-                    self.review_ids.discard(finding['finding_id'])
-                    self.counts['finding'] = len(self.review_ids)
-                else:
-                    self.store.finding(failed)
+                updated, evidence = {**finding,'episode_complete':False}, packet(self.goal, finding, seed, self.coverage_gaps)
+                self._record_assessment(updated, evidence,
+                    {'status':'unavailable','reason':'assessment_worker_' + type(exc).__name__},
+                    self.assessed_packets.get(finding['finding_id'], (1,None))[0] + 1)
 
     def _rolling_assessment(self, finding, seed):
         """Coalesce arrivals while inference runs; never wait for session exit.
@@ -749,21 +810,21 @@ class Engine:
         ready_at = time.monotonic() + min(.25, self.evaluation_wait_seconds)
         while True:
             with self.changed:
-                while not self.finished and not self.assessments_cancelled and (self.defer_evaluation or time.monotonic() < ready_at or self.event_generation == processed_generation):
+                while not self.finished and not self.assessments_cancelled and not self.assessments_closed and (self.defer_evaluation or time.monotonic() < ready_at or self.event_generation == processed_generation):
                     delay = max(.01, ready_at-time.monotonic()) if time.monotonic() < ready_at else None
                     self.changed.wait(timeout=.1 if self.defer_evaluation else delay)
-                if self.assessments_cancelled: return
+                if (self.assessments_cancelled or self.assessments_closed): return
                 generation = self.event_generation
                 updated, packet = self._episode(finding, seed)
                 final = self.finished
-                if packet == previous:
+                if (self.assessment_signature(packet) == self.assessment_signature(previous) if self.realtime else packet == previous):
                     processed_generation = generation
                     if final: return
                     ready_at = time.monotonic() + self.window_stride_seconds
                     continue
             revision = self.assessed_packets.get(finding['finding_id'], (1, None))[0] + 1
             self._assess(updated, packet, revision_number=revision)
-            if self.assessments_cancelled: return
+            if (self.assessments_cancelled or self.assessments_closed): return
             previous = self.assessed_packets[finding['finding_id']][1]
             processed_generation = generation
             if final: return
@@ -784,7 +845,7 @@ class Engine:
                 if self._tool_settled(finding['tool_use_id']):
                     break
                 self.changed.wait(timeout=0.1)
-            if self.assessments_cancelled: return
+            if (self.assessments_cancelled or self.assessments_closed): return
             finding, evidence_packet = self._episode(finding, seed)
         self._assess(finding, evidence_packet, revision_number=2)
         # A preliminary assessment of an active tool is not its final assessment.
@@ -795,24 +856,24 @@ class Engine:
                     if self._tool_settled(finding['tool_use_id']):
                         break
                     self.changed.wait(timeout=0.1)
-                if self.assessments_cancelled: return
+                if (self.assessments_cancelled or self.assessments_closed): return
                 final_finding, final_packet = self._episode(finding, seed)
             if final_packet != evidence_packet:
                 self._assess(final_finding, final_packet, revision_number=3)
 
     def _assess(self, finding: dict, evidence_packet: dict, *, revision_number: int) -> None:
-        if self.assessments_cancelled: return
+        if (self.assessments_cancelled or self.assessments_closed): return
         try:
             if not self.goal.strip():
                 judgement = {'status': 'unavailable', 'reason': 'initial_user_goal_not_received'}
             else:
                 while not self.judge_slots.acquire(timeout=.1):
-                    if self.assessments_cancelled: return
+                    if (self.assessments_cancelled or self.assessments_closed): return
                 try:
-                    if self.assessments_cancelled: return
+                    if (self.assessments_cancelled or self.assessments_closed): return
                     if self.live_windows and evidence_packet.get('live_window'):
                         with self.changed:
-                            if self.assessments_cancelled: return
+                            if (self.assessments_cancelled or self.assessments_closed): return
                             original, seed = self.candidate_seeds[finding['finding_id']]
                             finding, evidence_packet = self._episode(original, seed)
                     judgement = self.judge_fn(evidence_packet)
@@ -823,7 +884,7 @@ class Engine:
         with self.changed:
             # A request already in flight may finish after the wrapper saved its
             # summary. Never let that late answer change the frozen run result.
-            if self.assessments_cancelled: return
+            if (self.assessments_cancelled or self.assessments_closed): return
             self._record_assessment(finding, evidence_packet, judgement, revision_number)
 
     def _record_assessment(self, finding, evidence_packet, judgement, revision_number):
@@ -853,20 +914,23 @@ class Engine:
             if judgement.get('title') and judgement.get('status') == 'assessed':
                 revision['title'] = redact(judgement['title'], 160)
                 revision['message'] = judgement['rationale']
-        if judgement.get("status") not in {"scored", "assessed"}:
+        if judgement.get('status') == 'pending': revision['status'] = 'assessment_pending'
+        if judgement.get("status") not in {"scored", "assessed", 'pending'}:
             revision["coverage_gaps"] = list(dict.fromkeys(
                 [*revision["coverage_gaps"], "Decision model judgement unavailable"]
             ))
         if self.extended_analysis:
-            if (self.live_windows or self.assessments_cancelled) and revision['status'] == 'evaluation_unavailable' and finding['finding_id'] in self.last_reviews:
+            if (self.live_windows or self.assessments_cancelled) and revision['status'] in {'evaluation_unavailable', 'assessment_pending'} and finding['finding_id'] in self.last_reviews:
                 # A failed later assessment cannot refute the earlier valid
                 # review. Keep its original scope/citations and expose failure.
                 prior = self.last_reviews[finding['finding_id']]
                 revision = {**prior, 'revision': revision_number, 'time': revision['time'],
-                    'judge': judgement, 'latest_assessment_status': 'evaluation_unavailable',
+                    'judge': judgement, 'latest_assessment_status': 'assessment_pending' if judgement.get('status') == 'pending' else 'evaluation_unavailable',
                     'retained_review_revision': prior['revision'],
                     'coverage_gaps': list(dict.fromkeys([*prior['coverage_gaps'], *revision['coverage_gaps']])),
-                    'assessment_note': 'Earlier supported review retained with its original evidence; the latest model assessment was unavailable and did not clear it.'}
+                    'assessment_note': ('Earlier supported review retained with its original evidence; additional evidence was pending at session exit.'
+                        if judgement.get('status') == 'pending' else
+                        'Earlier supported review retained with its original evidence; the latest model assessment was unavailable and did not clear it.')}
             elif revision['status'] == 'review_required':
                 self.last_reviews[finding['finding_id']] = revision
             elif revision['status'] in {'consistent_with_goal', 'inconclusive'}:
@@ -884,6 +948,7 @@ class Engine:
         self.store.evaluations.append({"finding_id": finding["finding_id"], "revision": revision_number,
                                        "time": revision["time"], "packet": evidence_packet,
                                        "judgement": judgement, "disposition": revision["status"]})
+        self.assessment_states[finding['finding_id']] = judgement.get('status', 'unavailable')
         self.assessed_packets[finding['finding_id']] = (revision_number, evidence_packet)
         if self.finished: self.final_assessments.add(finding['finding_id'])
         if not self.extended_analysis or revision.get('is_alert'): self.alert_fn(revision)
@@ -912,7 +977,54 @@ class Engine:
             if thread.is_alive():
                 self.add_gap('evaluation worker did not finish before shutdown')
 
+    @staticmethod
+    def assessment_signature(evidence):
+        if evidence is None: return None
+        # Lifecycle/window labels alone do not change the facts being judged.
+        return json.dumps({k:v for k,v in evidence.items() if k not in
+            {'analysis_window','live_window','assessment_contract'}},sort_keys=True,separators=(',',':'))
+
+    def stop_live_assessments(self):
+        if self.realtime_requested:
+            with self.changed:
+                self.assessments_closed = True
+                self.changed.notify_all()
+
+    def _finish_realtime(self):
+        with self.changed:
+            # Freeze before inspecting final scope. No queued request may start,
+            # and an in-flight HTTP response cannot write after this point.
+            self.assessments_closed = True
+            self.finished = True
+            pending = []
+            for fid,(finding,seed) in self.candidate_seeds.items():
+                revision, previous = self.assessed_packets.get(fid,(1,None))
+                try:
+                    updated, current = self._episode(finding,seed)
+                except Exception:
+                    updated, current = {**finding,'episode_complete':False}, packet(self.goal,finding,seed,self.coverage_gaps)
+                    current['coverage_gaps'].append('final evidence scope could not be assembled')
+                if previous is not None and self.assessment_signature(previous) == self.assessment_signature(current):
+                    if self.assessment_states.get(fid) in {'assessed','scored'}: self.final_assessments.add(fid)
+                    continue
+                self.pending_assessment_ids.add(fid)
+                pending.append((updated,current,revision+1))
+            if pending:
+                self.add_gap('session ended with unassessed evidence; live assessments stopped without waiting; replay is required to complete analysis')
+            for finding,evidence,revision in pending:
+                judgement = ({'status':'unavailable','reason':'assessment_cancelled_on_shutdown'}
+                    if self.assessments_cancelled else {'status':'pending','reason':'session_ended_before_assessment'})
+                self._record_assessment(finding,evidence,judgement,revision)
+                self.final_assessments.discard(finding['finding_id'])
+            if not self.counts.get('hook'):
+                self.add_gap('no Codex hooks received; combined hook/runtime coverage was not achieved')
+            self.changed.notify_all()
+            if self.graph: self.graph.close()
+
     def finish(self) -> None:
+        if self.realtime or (self.realtime_requested and not self.goal.strip()):
+            self._finish_realtime()
+            return
         if self.counts.get("hook", 0) == 0:
             self.add_gap("no Codex hooks received; combined hook/runtime coverage was not achieved")
         unmatched = {hook["tool_use_id"] for hook in self.hooks if hook.get("tool_use_id") and hook.get("command")}
@@ -960,6 +1072,11 @@ class Engine:
 
     def summary(self) -> dict:
         return {
+            "final_review_complete": self.finished and not self.assessments_cancelled and all(
+                fid in self.final_assessments and self.assessment_states.get(fid) in {'assessed', 'scored'}
+                for fid in self.candidate_seeds),
+            "assessment_mode": "realtime" if self.realtime_requested else "deferred_or_legacy",
+            "pending_assessment_count": len(self.pending_assessment_ids),
             "goal": redact(self.goal, 1000),
             "counts": dict(self.counts),
             "coverage_gaps": list(self.coverage_gaps),

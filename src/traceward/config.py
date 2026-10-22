@@ -6,7 +6,8 @@ import os
 import shlex
 from pathlib import Path
 
-OBSERVER_KEYS = {"TRACEWARD_JUDGE_PROVIDER", "TRACEWARD_JUDGE_URL", "TRACEWARD_JUDGE_MODEL", "TRACEWARD_JUDGE_TOKEN"}
+OBSERVER_KEYS = {"TRACEWARD_JUDGE_PROVIDER", "TRACEWARD_JUDGE_URL", "TRACEWARD_JUDGE_MODEL", "TRACEWARD_JUDGE_TOKEN",
+                 "OPENROUTER_KEY", "LMSTUDIO_API_KEY"}
 
 
 def load_observer_env(path: Path | None = None, *, extra_keys=()) -> None:

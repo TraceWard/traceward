@@ -1,4 +1,8 @@
 # syntax=docker/dockerfile:1
+FROM python:3.11.14-slim-bookworm@sha256:65a93d69fa75478d554f4ad27c85c1e69fa184956261b4301ebaf6dbb0a3543d AS gvisor-build
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git patch build-essential crossbuild-essential-amd64 crossbuild-essential-arm64 clang libbpf-dev libelf-dev libssl-dev libnuma-dev pkg-config unzip zip && rm -rf /var/lib/apt/lists/*
+COPY src/traceward/runner_image/gvisor /recipe
+RUN --mount=type=cache,target=/root/.cache/bazel python3 /recipe/build.py
 FROM node:22.20.0-bookworm-slim@sha256:b21fe589dfbe5cc39365d0544b9be3f1f33f55f3c86c87a76ff65a02f8f5848e AS node
 FROM python:3.11.14-slim-bookworm@sha256:65a93d69fa75478d554f4ad27c85c1e69fa184956261b4301ebaf6dbb0a3543d AS guest
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
@@ -10,9 +14,8 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
  && npm install --global @openai/codex@0.159.3
 FROM guest AS runner
 ARG TARGETARCH
-ARG GVISOR_RELEASE=release-20260928.0
-RUN python3 -c 'import urllib.request,hashlib,tarfile,io,platform,pathlib; arch="aarch64" if platform.machine()=="aarch64" else "x86_64"; base="https://github.com/google/gvisor/releases/download/release-20260928.0/"; name="gvisor-"+arch+".tar.bz2"; data=urllib.request.urlopen(base+name).read(); sums=urllib.request.urlopen(base+"SHA256SUMS").read().decode(); expected=next(line.split()[0] for line in sums.splitlines() if line.split()[-1].lstrip("*")==name); assert hashlib.sha256(data).hexdigest()==expected; tarfile.open(fileobj=io.BytesIO(data),mode="r:bz2").extractall("/usr/local",filter="data")' \
- && ln -s /usr/local/runsc /usr/local/bin/runsc
+COPY --from=gvisor-build /out/bin/ /usr/local/bin/
+COPY --from=gvisor-build /out/gvisor-provenance.json /opt/traceward/gvisor-provenance.json
 COPY --from=guest / /opt/traceward/rootfs/
 COPY src/traceward /opt/traceward/src/traceward
 RUN pip install --no-cache-dir protobuf==6.33.5 \

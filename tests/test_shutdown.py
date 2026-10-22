@@ -165,7 +165,7 @@ class Parser:
         time.sleep(.002)
         return None
 with patch('traceward.cli.Engine', SlowEngine), patch('traceward.cli.GvisorParser', Parser):
-    raise SystemExit(cli.run(['--goal','No network','codex'],runtime_factory=Runtime,agent_name='pi'))
+    raise SystemExit(cli.run(['--goal','No network','--defer-judge','codex'],runtime_factory=Runtime,agent_name='pi'))
 '''
 
 
@@ -235,3 +235,26 @@ class WrapperSignalTests(unittest.TestCase):
 
     def test_ctrl_c_is_not_swallowed_while_processing_a_dead_agents_backlog(self):
         self.run_wrapper(signal.SIGINT, backlog=True)
+
+    def test_realtime_exit_does_not_wait_for_stalled_live_judge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);(root/'workspace').mkdir()
+            script=root/'wrapper.py'
+            script.write_text(WRAPPER.replace("'--defer-judge',",''))
+            stderr=root/'stderr'
+            with stderr.open('w') as log:
+                child=subprocess.Popen([sys.executable,str(script),str(root)],
+                    env=dict(os.environ,XDG_STATE_HOME=str(root/'state')),
+                    stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=log)
+                try:
+                    self.wait_for(lambda:(root/'agent-ready').exists() and (root/'judge-started').exists(),child,stderr)
+                    start=time.monotonic();child.send_signal(signal.SIGTERM)
+                    self.assertEqual(child.wait(timeout=2),128+signal.SIGTERM)
+                    self.assertLess(time.monotonic()-start,1)
+                    summary=json.loads(next((root/'state/traceward/runs').glob('*/summary.json')).read_text())
+                    self.assertEqual(summary['assessment_mode'],'realtime')
+                    self.assertEqual(summary['pending_assessment_count'],1)
+                    self.assertFalse(summary['assessment_wait_cancelled'])
+                    self.assertNotIn('waiting for',stderr.read_text())
+                finally:
+                    if child.poll() is None:child.kill();child.wait()

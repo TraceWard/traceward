@@ -460,3 +460,18 @@ message Ptrace {
   int64 request = 4;
   int32 pid = 5;
 }
+
+// FileDelete reports the actual pathname consumed by a deletion operation.
+// Pathname and start_path are captured before VFS mutation, not copied from a
+// userspace pointer at syscall exit. It reports directory-entry removal only.
+message FileDelete {
+  gvisor.common.ContextData context_data = 1;
+  Exit exit = 2;
+  uint64 sysno = 3;
+  int64 dirfd = 4;
+  string pathname = 5;
+  string start_path = 6;
+  uint32 flags = 7;
+  bool directory = 8;
+  string path_error = 9;
+}

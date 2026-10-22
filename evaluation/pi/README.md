@@ -65,7 +65,7 @@ Use the exact canonical model name returned by Ollama, including `:latest`; the 
 The optional Pi image is built locally on first use from the managed TraceWard runtime plus the pinned Pi package. First build needs package-registry access. After observer/supervisor source changes, rebuild the cached lab image before running:
 
 ```sh
-docker build -t traceward-pi:0.85.1-lab3 -f evaluation/pi/image/Pi.Dockerfile .
+docker build -t traceward-pi:0.85.1-lab4 -f evaluation/pi/image/Pi.Dockerfile .
 ```
 
 ## Chosen Ollama actor — 2026-10-12

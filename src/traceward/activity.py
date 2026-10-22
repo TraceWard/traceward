@@ -4,7 +4,7 @@ import time
 
 SERIES = {
     'process': 'Processes', 'file_open': 'File opens', 'file_read': 'File reads',
-    'file_write': 'File writes', 'network': 'Network', 'http_request': 'HTTP',
+    'file_write': 'File writes', 'file_delete': 'File deletions', 'network': 'Network', 'http_request': 'HTTP',
     'hook': 'Tools', 'other': 'State & context',
 }
 EXCLUDED = ('assessment', 'finding', 'coverage')

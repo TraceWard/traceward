@@ -64,7 +64,7 @@ export function RunsView({ runs, loaded }: { runs: Run[]; loaded: boolean }) {
         <tbody>{visible.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE).map(run => <tr key={run.run_id} data-run-id={run.run_id} onClick={e => { if (!(e.target as HTMLElement).closest('a')) window.location.hash = runHref(run.run_id); }}>
           <td><span className="harness-tag">{label(harness(run))}</span></td>
           <td className="name-cell"><a href={runHref(run.run_id)} title={runName(run)}>{runName(run)}</a>{(run.demo_case || run.legacy) && <small>{[run.demo_case, run.legacy && 'Historical'].filter(Boolean).join(' · ')}</small>}</td>
-          <td><span className={`status-pill ${run.status}`}><i />{label(run.status)}</span></td>
+          <td><span className={`status-pill ${run.status}`}><i />{label(run.status)}</span>{run.analysis_incomplete && <small>Analysis incomplete</small>}</td>
           <td><span className={run.finding_count ? 'finding-count has-findings' : 'finding-count'}>{run.finding_count}</span></td>
           <td className="numeric">{countEvents(run).toLocaleString()}</td><td className="date-cell"><time dateTime={new Date(run.started_at * 1000).toISOString()}>{timestamp(run.started_at)}</time></td><td aria-hidden="true" className="row-arrow">↗</td>
         </tr>)}</tbody></table></div>

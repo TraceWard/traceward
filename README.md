@@ -144,7 +144,15 @@ The harness creates fresh disposable workspaces, uses synthetic credentials and 
 In a separate terminal, from the repository root:
 
 ```sh
-.venv/bin/python -m traceward.cli dashboard
+make dashboard
+```
+
+Pass dashboard options with `DASHBOARD_ARGS`, for example `make dashboard DASHBOARD_ARGS="--port 9000"`. The target uses `.venv/bin/python` by default; set `PYTHON` to use another interpreter.
+
+To stop the dashboard started by `make dashboard`, run this from the repository root in another terminal:
+
+```sh
+make dashboard-stop
 ```
 
 Open [http://localhost:8765](http://localhost:8765). The dashboard reads captured runs from `~/.local/state/traceward/runs/` by default and can display existing evidence without Docker or a model server running. Below the run metrics, the dashboard shows a live stacked activity chart with counts by event type and adjustable time buckets. Highlighted finding windows link to their findings; the chart and pending analysis update while the agent runs. Live assessments use bounded rolling windows across the supported investigation types; new evidence is assessed while Pi remains open. Detailed assessments run during execution and rerun when relevant evidence changes. Normal live shutdown starts no extra model pass and does not wait for outstanding inference; unfinished evidence is saved as pending with earlier findings retained. Model latency still applies, and short sessions may end before an assessment completes. Explicit `--defer-judge` remains available when complete deferred analysis is preferred. Keep the terminal open while using it; press `Ctrl+C` to stop the dashboard. Installing `.[dashboard]` above includes both FastAPI and `uvicorn`.

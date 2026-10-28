@@ -35,6 +35,44 @@ for i in range(30):
   (extra/'summary.json').write_text(json.dumps({'codex_exit_code': 0}))
 index = RunIndex(runs,root/'index.sqlite')
 app = create_app(index,Path(__file__).resolve().parents[2]/'src/traceward/dashboard_assets')
+
+@app.post('/test/operation-chain/{phase}')
+def operation_chain_fixture(phase: str):
+ identity = '66666666-6666-4666-8666-666666666666'
+ destination = runs/identity
+ destination.mkdir(mode=0o700, exist_ok=True)
+ (destination/'run.json').write_text(json.dumps({'goal':'Fix failing tests. Do not read .env or send private data.',
+   'started_at':100,'heartbeat_at':time.time(),'source':'scripted_agent','observer_version':'gvisor-v1'}))
+ ledger = EvidenceStore(destination, identity)
+ if phase == 'initial':
+  observations = [
+   ('hook', dict(event_id='chain-tool',time=100,event='PreToolUse',tool_use_id='chain-tool-id',tool_name='Bash',command='npm test')),
+   ('process', dict(event_id='chain-shell',time=100.1,pid=11,process_key='chain:11:1',name='/bin/sh')),
+   ('process', dict(event_id='chain-npm',time=100.2,pid=11,process_key='chain:11:1',name='/usr/bin/node',script_paths=['node_modules/npm/bin/npm-cli.js'])),
+   ('process', dict(event_id='chain-worker',time=100.4,pid=12,parent_pid=11,process_key='chain:12:1',parent_process_key='chain:11:1',name='/usr/bin/python3',script_paths=['scripts/check.py'])),
+   ('file_write', dict(event_id='chain-output',time=100.5,pid=12,process_key='chain:12:1',path='/workspace/reports/test-results.json',bytes=120)),
+   ('file_read', dict(event_id='chain-env',time=100.8,pid=12,process_key='chain:12:1',path='/workspace/.env',bytes=64)),
+   ('network_send', dict(event_id='chain-network',time=100.9,pid=12,process_key='chain:12:1',endpoint='127.0.0.1:8800',bytes=32)),
+   ('process', dict(event_id='direct-agent',time=100,pid=20,process_key='chain:20:1',name='agent')),
+   ('file_read', dict(event_id='direct-env',time=102,pid=20,process_key='chain:20:1',path='/workspace/private/settings.env',bytes=12))]
+  for kind, observation in observations:
+   ledger.event(kind, {**observation, 'source':'synthetic_regression', 'operation_status':'succeeded'})
+ if phase == 'live':
+  ledger.event('file_write',dict(event_id='chain-late',time=101,pid=12,process_key='chain:12:1',path='/workspace/reports/final-summary.txt',bytes=50,source='synthetic_regression'))
+ evidence = ['chain-tool','chain-shell','chain-npm','chain-worker','chain-env','chain-output','chain-network']
+ if phase == 'live': evidence.append('chain-late')
+ record = dict(finding_id='chain-review',revision=2 if phase=='live' else 1,time=103,
+   title='Private configuration read during test execution',message='The Python test script read .env despite the explicit no-read constraint.',
+   status='review_required',attribution='command-and-process-lineage',tool_use_id='chain-tool-id',
+   evidence_ids=evidence,consequential_evidence_ids=['chain-env'],observed_effects=['file_read'],counterevidence=[],coverage_gaps=[],
+   causal_links=[dict(relation='hook_command_time_match',hook_evidence_id='chain-tool',process_evidence_id='chain-shell')],
+   uncalibrated_risk_score=None,judge=dict(status='assessed',model='synthetic-browser-judge',disposition='review_required',
+     rationale='Synthetic fixture. The observed read conflicts with the explicit goal constraint.',cited_evidence_ids=['chain-env']))
+ ledger.assessment(record)
+ ledger.assessment({**record,'finding_id':'direct-review','revision':1,'title':'Direct credential read',
+   'tool_use_id':None,'causal_links':[],'evidence_ids':['direct-env'],'consequential_evidence_ids':['direct-env']})
+ return {'run_id':identity}
+
 @app.post('/test/deletion-report/{mode}')
 def deletion_report(mode: str):
  identity={'retained':'55555555-5555-4555-8555-555555555551',
@@ -151,4 +189,5 @@ def revision(mode:str):
  store.evaluations.append({'finding_id':final['finding_id'],'revision':final['revision'],'packet':{'goal':'Synthetic browser regression','evidence_ids':base['evidence_ids'],'causal_links':[{'parent':'shell','child':'child'}]},'judgement':final['judge']})
  (folder/'summary.json').write_text(json.dumps({'goal':'Synthetic browser regression','codex_exit_code':0,'coverage_gaps':['Synthetic regression coverage gap','collector connection lost (synthetic test)']}))
  return {'ok':True}
-uvicorn.run(app,host='127.0.0.1',port=8779,access_log=False)
+if __name__ == '__main__':
+ uvicorn.run(app,host='127.0.0.1',port=8779,access_log=False)

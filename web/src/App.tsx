@@ -1,8 +1,9 @@
 import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 
-import type { Run, Event, Finding, Raw } from "./types";
+import type { Run, Event, Finding, Raw, OperationChain } from "./types";
 import { RunsView, FindingsView, readRoute } from "./views";
 import ActivityChart from './ActivityChart';
+import OperationChainView from './OperationChain';
 
 const short = (value: string, size = 8) => value?.slice(0, size) || "—";
 const date = (value?: number, millis = false) =>
@@ -218,6 +219,10 @@ export default function App() {
   const [findings, setFindings] = useState<Finding[]>([]);
   const [assessmentAudit, setAssessmentAudit] = useState(false);
   const [evidence, setEvidence] = useState<Event[]>([]);
+  const [operationChain, setOperationChain] = useState<OperationChain | null>(null);
+  const [chainError, setChainError] = useState('');
+  const [evidenceRefresh, setEvidenceRefresh] = useState(0);
+  const refreshOperationChain = useRef<() => void>(() => {});
   const [selectedFinding, setSelectedFinding] = useState<string>("");
   const [selectedEvent, setSelectedEvent] = useState<Event | null>(null);
   const [tab, setTab] = useState<"timeline" | "processes">("timeline");
@@ -284,6 +289,7 @@ export default function App() {
       setEvaluations(evaluationData.evaluations);
       setPendingAssessments(assessmentData.assessments.filter(a => a.status === 'provisional').length);
       setLoadedRun(runId);
+      setEvidenceRefresh(current => current + 1);
       setSelectedFinding((current) =>
         current && visible.some((f) => f.finding_id === current)
           ? current
@@ -333,22 +339,47 @@ export default function App() {
   }, [loadRun, runId]);
   const run = runs.find((item) => item.run_id === runId);
   const finding = findings.find((item) => item.finding_id === selectedFinding);
+  const displayedChain = operationChain?.run_id === runId && operationChain.finding_id === finding?.finding_id
+    && operationChain.revision === finding?.revision ? operationChain : null;
   const effectiveJudge = finding?.effective_judge ?? (finding?.assessment_attempt_status ? null : finding?.judge);
   const cancelledAssessment = finding?.assessment_attempt_status === 'cancelled';
   const endedPending = finding?.judge?.reason === 'session_ended_before_assessment';
   useEffect(() => {
-    if (!runId || !finding?.evidence_ids?.length) {
+    if (!runId || !finding) {
       setEvidence([]);
+      setOperationChain(null);
+      setChainError('');
       return;
     }
+    const assessment = finding;
     let cancelled = false;
-    void get<{ events: Event[] }>(
-      `/api/runs/${runId}/evidence?ids=${encodeURIComponent(finding.evidence_ids.join(","))}`,
+    let loading = false;
+    function refresh() {
+      if (loading || cancelled) return;
+      loading = true;
+      void get<OperationChain>(
+      `/api/runs/${runId}/findings/${encodeURIComponent(assessment.finding_id)}/operation-chain?revision=${assessment.revision}`,
     )
-      .then((data) => { if (!cancelled) setEvidence(data.events); })
-      .catch(() => { if (!cancelled) setEvidence([]); });
-    return () => { cancelled = true; };
+      .then((data) => {
+        if (cancelled) return;
+        setOperationChain(data);
+        setChainError('');
+        setEvidence([...new Map([...data.evidence, ...data.nodes.map(node => node.event)]
+          .map(event => [event.metadata.uid, event])).values()].sort((a, b) => a.time-b.time || (a.index_id || 0)-(b.index_id || 0)));
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setChainError('Operation evidence could not be refreshed. Retrying automatically.');
+        void get<{events: Event[]}>(`/api/runs/${runId}/evidence?ids=${encodeURIComponent(assessment.evidence_ids.join(','))}`)
+          .then(data => {if (!cancelled) setEvidence(data.events);}).catch(() => {});
+      })
+      .finally(() => { loading = false; });
+    }
+    refreshOperationChain.current = refresh;
+    refresh();
+    return () => { cancelled = true; refreshOperationChain.current = () => {}; };
   }, [runId, finding?.finding_id, finding?.revision]);
+  useEffect(() => { refreshOperationChain.current(); }, [evidenceRefresh]);
   const shown = useMemo(
     () =>
       (filter === "evidence" && finding && !hooksOnly ? evidence : events).filter((event) => {
@@ -569,7 +600,7 @@ export default function App() {
                   <div className="segment subtle">
                     <button
                       className={view === "combined" ? "on" : ""}
-                      onClick={() => setView("combined")}
+                      onClick={() => { setView("combined"); if (filter === "hook") setFilter("all"); }}
                     >
                       Combined
                     </button>
@@ -757,6 +788,11 @@ export default function App() {
                                 {finding.observed_effects.join(" + ")}
                               </small>
                             </div>
+                            <OperationChainView key={`${runId}:${finding.finding_id}`} chain={displayedChain} error={chainError}
+                              titleForEvent={eventTitle} renderDetails={(event, close) => <>
+                                <div className="inline-event-heading"><strong>Event details</strong><button type="button" aria-label="Close operation details" onClick={close}>Close details ×</button></div>
+                                <EventDetails selectedEvent={event} openRaw={openRaw}/>
+                              </>}/>
                             {finding.assessment_note && <p className="assessment-note">{finding.assessment_note}</p>}
                             {finding.analysis_window && <p className="window-status">Rolling {finding.analysis_window.duration_seconds}-second observation window with relevant earlier causal evidence. {finding.analysis_window.agent_finished ? 'Final session context.' : run.status === 'live' ? 'Assessed while the session was running; new evidence feeds later windows.' : 'Assessed during execution.'}</p>}
                             {cancelledAssessment && <p className="assessment-status" role="status">{effectiveJudge

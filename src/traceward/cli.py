@@ -32,7 +32,7 @@ def _usage() -> str:
         "usage: traceward run [--goal TEXT | --goal-file PATH] [--context-mode metadata|redacted] [--validation-script PATH] [--permissions-file PATH] [--shared-root PATH] [--judge-provider lmstudio|openrouter] [--judge-url URL] [--judge-model MODEL] [--runner-image IMAGE] [--workspace PATH] [--guest-image IMAGE] [--defer-judge] codex [AGENT FLAGS...] [INITIAL INSTRUCTION]\n"
         "       traceward eval pi [--cases CASE...] [--trials N] [--actor-model MODEL] [--actor-url URL]\n"
         "       traceward watch RUN_ID\n"
-        "       traceward dashboard [--runs-dir PATH] [--port PORT]\n"
+        "       traceward dashboard [--runs-dir PATH] [--host ADDRESS] [--port PORT]\n"
         "       traceward replay --goal TEXT --hooks FILE --trace FILE\n"
         "       traceward rebuild-graph"
     )

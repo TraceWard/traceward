@@ -1,4 +1,4 @@
-"""Dashboard ingestion, revision semantics, and local-only API tests."""
+"""Dashboard ingestion, revision semantics, and network access tests."""
 
 from __future__ import annotations
 
@@ -159,6 +159,38 @@ class DashboardTests(unittest.TestCase):
     def test_cross_origin_and_host_rejected(self):
         self.assertEqual(self.client.get("/api/runs", headers={"Host": "attacker.example"}).status_code, 403)
         self.assertEqual(self.client.get("/api/runs", headers={"Origin": "https://attacker.example"}).status_code, 403)
+
+    def test_lan_and_ipv6_hosts_allow_same_origin_requests(self):
+        for authority in ("192.0.2.10:8765", "10.0.0.8:9000", "[::1]:8765", "[fd00::8]:8765", "localhost:8765"):
+            with self.subTest(authority=authority):
+                url = f"http://{authority}/api/runs"
+                self.assertEqual(self.client.get(url).status_code, 200)
+                response = self.client.get(url, headers={"Origin": f"http://{authority}"})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.headers["Cache-Control"], "no-store")
+                self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+
+    def test_lan_requests_reject_other_origins_and_malformed_ports(self):
+        for origin in ("http://192.0.2.11:8765", "http://192.0.2.10:9000",
+                       "https://192.0.2.10:8765", "http://localhost:8765", "null",
+                       "http://192.0.2.10:invalid", "http://[invalid"):
+            with self.subTest(origin=origin):
+                response = self.client.get("http://192.0.2.10:8765/api/runs", headers={"Origin": origin})
+                self.assertEqual(response.status_code, 403)
+
+    def test_same_origin_normalizes_default_ports(self):
+        response = self.client.get("http://192.0.2.10/api/runs", headers={"Origin": "http://192.0.2.10:80"})
+        self.assertEqual(response.status_code, 200)
+
+    def test_explicit_bind_hostname_is_accepted(self):
+        with TestClient(create_app(self.index, bind_host="traceward.local"), base_url="http://traceward.local:8765") as client:
+            self.assertEqual(client.get("/api/runs", headers={"Origin": "http://traceward.local:8765"}).status_code, 200)
+            self.assertEqual(client.get("/api/runs", headers={"Host": "attacker.example"}).status_code, 403)
+
+    def test_event_stream_injects_request_instead_of_query_parameter(self):
+        stream = next(route for route in self.client.app.routes if route.path == "/api/stream")
+        self.assertEqual(stream.dependant.request_param_name, "request")
+        self.assertEqual(stream.dependant.query_params, [])
 
     def test_cross_run_findings_use_latest_revision_per_run_and_exclude_audit(self):
         from traceward.ocsf import EvidenceStore

@@ -1,5 +1,6 @@
 import {test,expect} from '@playwright/test';
 const id='11111111-1111-4111-8111-111111111111';
+
 test('JSONL revisions, views, chronology, pagination and evidence survive reopening',async({page,request})=>{
  await page.goto('/');
  await page.locator(`[data-run-id="${id}"] a`).click();
@@ -342,6 +343,30 @@ test('stacked activity and finding windows update live and open the related find
  await page.goto('about:blank');
 });
 
+test('evidence source tabs restore runtime records after Hooks only',async({page,request})=>{
+ const {run_id}=await (await request.post('/test/hooks')).json();
+ await page.goto(`/#runs/${run_id}?view=evidence`);
+ for(const target of ['Combined','Runtime only']) {
+  await page.getByRole('button',{name:'Hooks only',exact:true}).click();
+  await expect(page.getByLabel('Event type')).toHaveValue('hook');
+  await page.getByLabel('Hook event').selectOption('PreToolUse');
+  await expect(page.locator('[data-kind="hook"]')).toHaveCount(1);
+  await expect(page.locator('[data-kind="file_read"]')).toHaveCount(0);
+  await page.getByRole('button',{name:target,exact:true}).click();
+  await expect(page.getByLabel('Event type')).toHaveValue('all');
+  await expect(page.getByLabel('Hook event')).toHaveCount(0);
+  await expect(page.locator('[data-kind="file_read"]').first()).toBeVisible();
+ }
+ await page.getByLabel('Event type').selectOption('file_read');
+ await page.getByRole('button',{name:'Combined',exact:true}).click();
+ await expect(page.getByLabel('Event type')).toHaveValue('file_read');
+ await expect(page.locator('[data-kind="file_read"]').first()).toBeVisible();
+ await page.getByLabel('Event type').selectOption('all');
+ await page.getByRole('button',{name:'Load earlier events'}).click();
+ await expect(page.locator('[data-kind="hook"]')).toHaveCount(7);
+ await expect(page.locator('[data-kind="file_read"]')).toHaveCount(300);
+});
+
 test('all lifecycle hooks are visible beyond finding citations and runtime pagination',async({page,request})=>{
  const response=await request.post('/test/hooks');
  const {run_id}=await response.json();
@@ -415,4 +440,82 @@ test('fast exit distinguishes pending evidence from model failure and retains co
    await expect(page.locator('.model-unavailable')).toHaveCount(0);
   }
  }
+});
+
+test('operation chains expose script ancestry, related branches, live revisions and mobile evidence', async({page,request})=>{
+ const fixture=await (await request.post('/test/operation-chain/initial')).json();
+ await page.goto(`/#runs/${fixture.run_id}?finding=chain-review`);
+ const chain=page.getByRole('region',{name:'How this happened',exact:true});
+ await expect(chain.locator('.operation-card')).toHaveCount(5);
+ await expect(chain).toContainText('npm test');
+ await expect(chain).toContainText('scripts/check.py');
+ await expect(chain.locator('.operation-link[data-basis=inferred]')).toHaveCount(1);
+ await expect(chain).toContainText('Same process · execution transition');
+ await expect(chain.locator('[data-finding-effect=true]')).toContainText('/workspace/.env');
+ await expect(chain.getByText('Finding effect',{exact:true})).toHaveCount(1);
+ await expect(chain).not.toContainText('test-results.json');
+ const branches=chain.getByRole('button',{name:'2 related branches'});
+ await branches.click();
+ await expect(chain).toContainText('test-results.json');
+ await expect(chain).toContainText('127.0.0.1:8800');
+ const operation=chain.getByRole('button',{name:'Inspect operation /workspace/.env',exact:true});
+ await operation.scrollIntoViewIfNeeded();
+ const scroll=await page.locator('.main').evaluate(el=>el.scrollTop);
+ await operation.click();
+ const details=chain.getByRole('region',{name:'Operation event details',exact:true});
+ await expect(details).toContainText('chain-env');
+ await details.getByRole('button',{name:'Close operation details'}).click();
+ await expect(operation).toBeFocused();
+ await expect.poll(()=>page.locator('.main').evaluate(el=>el.scrollTop)).toBe(scroll);
+ await request.post('/test/operation-chain/live');
+ await expect(page.locator('.finding-alert')).toHaveAttribute('data-revision','2');
+ await expect(chain.getByRole('button',{name:'3 related branches'})).toHaveAttribute('aria-expanded','true');
+ await expect(chain).toContainText('final-summary.txt');
+ await page.setViewportSize({width:390,height:844});
+ await operation.press('Enter');
+ await expect(details).toBeVisible();
+ expect(await page.locator('body').evaluate(el=>el.scrollWidth)).toBeLessThanOrEqual(390);
+ await details.getByRole('button',{name:'Close operation details'}).click();
+ await expect(operation).toBeFocused();
+ await page.getByRole('button',{name:/Direct credential read/}).click();
+ await expect(chain.locator('.operation-card')).toHaveCount(2);
+ await expect(chain).toContainText('private/settings.env');
+ await expect(chain).not.toContainText('scripts/check.py');
+});
+
+test('operation chains discard delayed responses for previously selected findings',async({page,request})=>{
+ const fixture=await (await request.post('/test/operation-chain/initial')).json();
+ let release: ()=>void = ()=>{};
+ let started: ()=>void = ()=>{};
+ const waiting=new Promise<void>(resolve=>{started=resolve;});
+ const gate=new Promise<void>(resolve=>{release=resolve;});
+ await page.route('**/findings/chain-review/operation-chain?*',async route=>{
+   const response=await route.fetch(); started(); await gate; await route.fulfill({response});
+ });
+ await page.goto(`/#runs/${fixture.run_id}?finding=chain-review`);
+ await waiting;
+ await page.getByRole('button',{name:/Direct credential read/}).click();
+ const chain=page.getByRole('region',{name:'How this happened',exact:true});
+ await expect(chain).toContainText('private/settings.env');
+ release();
+ await expect(chain).not.toContainText('scripts/check.py');
+ await expect(chain.locator('.operation-card')).toHaveCount(2);
+});
+
+test('a slow operation projection completes across the live polling cycle',async({page,request})=>{
+ const fixture=await (await request.post('/test/operation-chain/initial')).json();
+ let release: ()=>void = ()=>{};
+ const gate=new Promise<void>(resolve=>{release=resolve;});
+ let projections=0;
+ let polls=0;
+ await page.route(`**/api/runs/${fixture.run_id}/findings`,async route=>{polls++; await route.continue();});
+ await page.route('**/findings/chain-review/operation-chain?*',async route=>{
+   projections++; const response=await route.fetch(); await gate; await route.fulfill({response});
+ });
+ await page.goto(`/#runs/${fixture.run_id}?finding=chain-review`);
+ await expect.poll(()=>projections).toBe(1);
+ await expect.poll(()=>polls,{timeout:10000}).toBeGreaterThan(1);
+ expect(projections).toBe(1);
+ release();
+ await expect(page.getByRole('region',{name:'How this happened'}).locator('[data-finding-effect=true]')).toContainText('/workspace/.env');
 });

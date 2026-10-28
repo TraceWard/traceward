@@ -1,9 +1,8 @@
 """Local, read-only investigation dashboard for TraceWard run files."""
 
-from __future__ import annotations
-
 import argparse
 import asyncio
+import ipaddress
 import json
 import os
 import sqlite3
@@ -345,6 +344,31 @@ class RunIndex:
                                    [_run_id(run_id), *ids]).fetchall()
             return [json.loads(row["body"]) for row in rows]
 
+    def operation_chain(self, run_id: str, finding_id: str, revision: int | None = None) -> dict | None:
+        from .operation_chain import build_operation_chain
+        with self.lock:
+            row = self.db.execute(
+                'SELECT body FROM findings WHERE run_id=? AND finding_id=? '
+                + ('AND revision=? ' if revision is not None else '')
+                + 'ORDER BY revision DESC LIMIT 1',
+                (run_id, finding_id, revision) if revision is not None else (run_id, finding_id)).fetchone()
+            if row is None:
+                return None
+            finding = json.loads(row['body'])
+            # Fetch lifecycle anchors across the run, not a paginated timeline.
+            rows = list(self.db.execute(
+                "SELECT id,body FROM events WHERE run_id=? AND kind IN ('process','process_exit','hook')",
+                (run_id,)))
+            ids = list(set(finding.get('evidence_ids', [])) | set(finding.get('consequential_evidence_ids', [])))
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                markers = ','.join('?' for _ in chunk)
+                rows.extend(self.db.execute(
+                    f'SELECT id,body FROM events WHERE run_id=? AND event_id IN ({markers})', (run_id, *chunk)))
+            events = {row['id']: {**json.loads(row['body']), 'index_id': row['id']} for row in rows}
+            return {**build_operation_chain(finding, list(events.values())), 'run_id': run_id,
+                    'projection_revision': self.revision}
+
     def evaluations(self, run_id: str) -> list[dict]:
         path = self._run_dir(run_id) / "evaluations.jsonl"
         if path.is_symlink() or not path.is_file():
@@ -382,7 +406,7 @@ class RunIndex:
         return {"source": source, "lines": excerpt, "truncated": len(excerpt) >= 81}
 
 
-def create_app(index: RunIndex, assets: Path | None = None):
+def create_app(index: RunIndex, assets: Path | None = None, *, bind_host: str = "0.0.0.0"):
     try:
         from fastapi import FastAPI, HTTPException, Query, Request
         from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -393,14 +417,24 @@ def create_app(index: RunIndex, assets: Path | None = None):
     app = FastAPI(title="TraceWard local dashboard", docs_url=None, redoc_url=None, openapi_url=None)
 
     @app.middleware("http")
-    async def local_only(request: Request, call_next):
-        host = request.headers.get("host", "").split(":")[0].lower()
+    async def same_origin_only(request: Request, call_next):
+        # Accept IP literals for LAN access without trusting arbitrary DNS names.
+        try:
+            host = request.url.hostname or ""
+            if host not in {"localhost", bind_host.lower()}:
+                ipaddress.ip_address(host)
+        except ValueError:
+            return JSONResponse({"detail": "IP address or configured host required"}, status_code=403)
         origin = request.headers.get("origin")
-        if host not in {"127.0.0.1", "localhost"}:
-            return JSONResponse({"detail": "local host only"}, status_code=403)
         if origin:
-            parsed = urlsplit(origin)
-            if parsed.hostname not in {"127.0.0.1", "localhost"} or parsed.port != request.url.port:
+            try:
+                parsed = urlsplit(origin)
+                default_ports = {"http": 80, "https": 443}
+                same_origin = (parsed.scheme, parsed.hostname, parsed.port or default_ports.get(parsed.scheme)) == (
+                    request.url.scheme, host, request.url.port or default_ports.get(request.url.scheme))
+            except ValueError:
+                same_origin = False
+            if not same_origin:
                 return JSONResponse({"detail": "cross-origin requests disabled"}, status_code=403)
         response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
@@ -455,6 +489,15 @@ def create_app(index: RunIndex, assets: Path | None = None):
         index.refresh()
         required_run(run_id)
         return index.activity(run_id, interval)
+
+    @app.get('/api/runs/{run_id}/findings/{finding_id}/operation-chain')
+    def operation_chain(run_id: str, finding_id: str, revision: int | None = Query(default=None, ge=1)):
+        index.refresh()
+        required_run(run_id)
+        result = index.operation_chain(run_id, finding_id, revision)
+        if result is None:
+            raise HTTPException(404, 'Assessment revision not found')
+        return result
 
     @app.get("/api/runs/{run_id}/processes")
     def processes(run_id: str):
@@ -517,6 +560,7 @@ def create_app(index: RunIndex, assets: Path | None = None):
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="traceward dashboard")
     parser.add_argument("--runs-dir", type=Path, default=state_root())
+    parser.add_argument("--host", default="0.0.0.0", help="bind address (default: 0.0.0.0, all IPv4 interfaces)")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
@@ -526,6 +570,9 @@ def main(argv: list[str]) -> int:
         raise RuntimeError("dashboard assets missing; run 'npm ci && npm run build' in web/")
     import uvicorn
     index = RunIndex(args.runs_dir)
-    print(f"TraceWard dashboard: http://127.0.0.1:{args.port} (reading {index.runs_dir})", flush=True)
-    uvicorn.run(create_app(index, assets), host="127.0.0.1", port=args.port, access_log=False)
+    display_host = f"[{args.host}]" if ":" in args.host else args.host
+    print(f"TraceWard dashboard: http://{display_host}:{args.port} (reading {index.runs_dir})", flush=True)
+    if args.host == "0.0.0.0":
+        print(f"Open http://localhost:{args.port} locally, or http://<this computer's LAN IP>:{args.port} on your network.", flush=True)
+    uvicorn.run(create_app(index, assets, bind_host=args.host), host=args.host, port=args.port, access_log=False)
     return 0

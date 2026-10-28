@@ -161,6 +161,8 @@ TRACEWARD_TEST_DOCKER=1 python3 -m unittest discover -s tests -p test_gvisor_int
 npm run test:e2e --prefix web
 ```
 
+The dashboard binds to `0.0.0.0:8765` by default. Use `http://<host LAN IP>:8765` from another device on the network, or `--host 127.0.0.1` for access only from the host. It has no authentication; reachable clients can read captured evidence. Browser API and event-stream requests must use the dashboard's own origin.
+
 Browser tests use Chrome by default; set `PLAYWRIGHT_CHANNEL` for another installed supported browser. They use explicitly synthetic decisions against real JSONL/API projections. Real six-case validation, actual decisions, UI inspection and measurements are documented in [DEMO.md](../DEMO.md) and [VALIDATION.md](../VALIDATION.md).
 
 Replay preserves source attachments:

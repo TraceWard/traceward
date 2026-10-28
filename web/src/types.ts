@@ -50,6 +50,7 @@ export type Event = {
       event_kind?: string;
       process_key?: string;
       parent_process_key?: string;
+      script_paths?: string[];
       raw_trace_ref?: string;
       hook_event?: string;
       native_event?: string;
@@ -106,3 +107,18 @@ export type Finding = {
   revisions: Finding[];
 };
 export type Raw = { source: string; lines: { line: number; text: string }[] };
+
+export type OperationChain = {
+  run_id: string;
+  finding_id: string;
+  revision: number;
+  projection_revision: number;
+  nodes: {id: string; kind: string; event: Event; is_consequential: boolean; on_path: boolean}[];
+  edges: {source: string; target: string; relation: string; basis: 'observed' | 'inferred'; label: string}[];
+  roots: string[];
+  consequential_evidence_ids: string[];
+  gaps: string[];
+  missing_evidence_ids: string[];
+  associations: {relation: string; confidence?: string}[];
+  evidence: Event[];
+};

@@ -57,7 +57,8 @@ class Engine:
                  measure_latency: bool = True, evaluation_wait_seconds: float = 10, coverage_gaps: list[str] | None = None,
                  defer_evaluation: bool = False, workspace: str | None = None,
                  extended_analysis: bool = False, context_mode: str = 'metadata',
-                 graph_path=None, shared_roots=(), transport_endpoints=(), agent_state_roots=(), realtime=False):
+                 graph_path=None, shared_roots=(), transport_endpoints=(), agent_state_roots=(), realtime=False,
+                 graph_factory=None):
         self.goal, self.store = goal, store
         self.judge_fn = judge_fn
         self.judge_slots = threading.BoundedSemaphore(2)
@@ -77,8 +78,9 @@ class Engine:
         self.agent_state_roots = tuple(p.rstrip('/')+'/' for p in agent_state_roots)
         self.semantic_events: list[dict] = []
         self.candidate_seeds, self.state_updates, self.assessed_packets = {}, {}, {}
-        self.graph = EvidenceGraph(graph_path or store.run_dir / 'evidence-graph.sqlite', store.run_id,
-                                   shared_roots) if extended_analysis else None
+        self.graph = ((graph_factory(store.run_id, shared_roots) if graph_factory else
+                       EvidenceGraph(graph_path or store.run_dir / 'evidence-graph.sqlite', store.run_id, shared_roots))
+                      if extended_analysis else None)
         self.write_candidates: set[str] = set()
         self.delete_candidates: set[str] = set()
         self.delete_groups = {}
@@ -130,7 +132,7 @@ class Engine:
 
     def observe(self, item: dict) -> dict:
         with self.changed:
-            item = {**item, 'event_id': str(uuid.uuid4())}
+            item = {**item, 'event_id': self._event_id(item)}
             if item['kind'] in {'context', 'agent_claim'}:
                 item['trust'] = 'agent_claim' if item['kind'] == 'agent_claim' else 'lower_trust_content'
             duplicate_state = False
@@ -197,8 +199,13 @@ class Engine:
             self.last_arrival = time.monotonic()
             self.changed.notify_all()
 
+    def _event_id(self, item):
+        if item.get('event_id'): return item['event_id']
+        factory = getattr(self.store, 'new_id', None)
+        return factory(item.get('kind', item.get('event', 'event')), item) if factory else str(uuid.uuid4())
+
     def _hook(self, item: dict) -> None:
-        item = {**item, "event_id": str(uuid.uuid4())}
+        item = {**item, "event_id": self._event_id(item)}
         self.store.event("hook", item)
         self.counts["hook"] += 1
         if self.graph: self.graph.add({**item, 'kind': 'hook'})
@@ -233,7 +240,7 @@ class Engine:
                 # not present a CLONE_THREAD task as a new child process.
                 self._link()
                 return
-            created = {"kind": "process", "event_id": str(uuid.uuid4()),
+            created = {"kind": "process", "event_id": self._event_id({**item, 'kind':'fork_process'}),
                        "time": item["time"], "pid": item["child_pid"],
                        "parent_pid": item["pid"], "name": "forked process",
                        "process_key": item.get("child_process_key", item["child_pid"]),
@@ -248,7 +255,7 @@ class Engine:
             return
         if kind not in {"process", "process_exit", "file_open", "file_read", "file_write", "network", "network_send", "file_delete"}:
             return
-        item = {**item, "event_id": str(uuid.uuid4())}
+        item = {**item, "event_id": self._event_id(item)}
         # raw_args is used only transiently for hook matching, never exported.
         export = {k: v for k, v in item.items() if k != "raw_args"}
         self.store.event(kind, export)
@@ -511,7 +518,8 @@ class Engine:
         seed = sorted({e["event_id"]: e for e in seed}.values(), key=lambda e: (e["time"], e["event_id"]))
         ids = [event["event_id"] for event in seed]
         finding = {
-            "finding_id": str(uuid.uuid4()), "revision": 1, "time": time.time(),
+            "finding_id": self.store.finding_id(key) if hasattr(self.store, 'finding_id') else str(uuid.uuid4()),
+            "revision": 1, "time": effect.get('time', time.time()),
             "title": title,
             "message": message,
             "status": "provisional", "attribution": ("command-and-process-lineage" if hook and hook.get("command")
@@ -686,6 +694,7 @@ class Engine:
         if self.extended_analysis:
             updated, evidence, gaps = self._augment_episode(updated, evidence, gaps)
         evidence_packet = packet(self.goal, updated, evidence, gaps)
+        evidence_packet['workspace'] = self.workspace
         if self.extended_analysis:
             evidence_packet.update({'packet_version': 3, 'analysis_version': 2,
                 'candidate_kind': updated.get('candidate_kind'),
@@ -814,12 +823,17 @@ class Engine:
                     delay = max(.01, ready_at-time.monotonic()) if time.monotonic() < ready_at else None
                     self.changed.wait(timeout=.1 if self.defer_evaluation else delay)
                 if (self.assessments_cancelled or self.assessments_closed): return
+                if previous is None:
+                    previous = self.assessed_packets.get(finding['finding_id'], (1, None))[1]
                 generation = self.event_generation
                 updated, packet = self._episode(finding, seed)
                 final = self.finished
                 if (self.assessment_signature(packet) == self.assessment_signature(previous) if self.realtime else packet == previous):
                     processed_generation = generation
-                    if final: return
+                    if final:
+                        if self.assessment_states.get(finding['finding_id']) in {'assessed', 'scored'}:
+                            self.final_assessments.add(finding['finding_id'])
+                        return
                     ready_at = time.monotonic() + self.window_stride_seconds
                     continue
             revision = self.assessed_packets.get(finding['finding_id'], (1, None))[0] + 1

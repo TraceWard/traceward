@@ -165,7 +165,7 @@ class Parser:
         time.sleep(.002)
         return None
 with patch('traceward.cli.Engine', SlowEngine), patch('traceward.cli.GvisorParser', Parser):
-    raise SystemExit(cli.run(['--goal','No network','--defer-judge','codex'],runtime_factory=Runtime,agent_name='pi'))
+    raise SystemExit(cli._local_run(['--goal','No network','--defer-judge','codex'],runtime_factory=Runtime,agent_name='pi'))
 '''
 
 

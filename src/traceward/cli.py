@@ -29,16 +29,18 @@ def state_root() -> Path:
 
 def _usage() -> str:
     return (
-        "usage: traceward run [--goal TEXT | --goal-file PATH] [--context-mode metadata|redacted] [--validation-script PATH] [--permissions-file PATH] [--shared-root PATH] [--judge-provider lmstudio|openrouter] [--judge-url URL] [--judge-model MODEL] [--runner-image IMAGE] [--workspace PATH] [--guest-image IMAGE] [--defer-judge] codex [AGENT FLAGS...] [INITIAL INSTRUCTION]\n"
+        "usage: traceward run [--traceward-url URL] [--agent-id ID | --agent-slug SLUG] [--goal TEXT | --goal-file PATH] [--context-mode metadata|redacted] [--workspace PATH] [--guest-image IMAGE] [--defer-judge] codex|pi [AGENT FLAGS...] [INITIAL INSTRUCTION]\n"
+        "       traceward backend [--host ADDRESS] [--port PORT]\n"
+        "       traceward sync RUN_ID [--traceward-url URL]\n"
         "       traceward eval pi [--cases CASE...] [--trials N] [--actor-model MODEL] [--actor-url URL]\n"
-        "       traceward watch RUN_ID\n"
-        "       traceward dashboard [--runs-dir PATH] [--host ADDRESS] [--port PORT]\n"
+        "       traceward watch RUN_ID [--traceward-url URL]\n"
+        "       traceward dashboard [--host ADDRESS] [--port PORT]\n"
         "       traceward replay --goal TEXT --hooks FILE --trace FILE\n"
         "       traceward rebuild-graph"
     )
 
 
-def _parse_run(args: list[str], *, instruction_parser=codex_instruction) -> tuple:
+def _parse_run(args: list[str], *, instruction_parser=codex_instruction, server_analysis=False) -> tuple:
     goal = goal_file = image = workspace = guest_image = None
     judge_options = {}
     agent_options = {}
@@ -49,10 +51,12 @@ def _parse_run(args: list[str], *, instruction_parser=codex_instruction) -> tupl
             agent_options['defer_evaluation'] = True
             index += 1
             continue
-        if flag not in {"--goal", "--goal-file", "--runner-image", "--workspace", "--guest-image", "--judge-provider", "--judge-url", "--judge-model", '--context-mode', '--validation-script', '--permissions-file', '--shared-root'} or index + 1 >= len(args):
+        if flag not in {"--traceward-url", "--agent-id", "--agent-slug", "--goal", "--goal-file", "--runner-image", "--workspace", "--guest-image", "--judge-provider", "--judge-url", "--judge-model", '--context-mode', '--validation-script', '--permissions-file', '--shared-root'} or index + 1 >= len(args):
             raise ValueError(_usage())
         value = args[index + 1]
-        if flag == '--goal':
+        if flag in {'--traceward-url','--agent-id','--agent-slug'}:
+            agent_options[flag[2:].replace('-','_')] = value
+        elif flag == '--goal':
             goal = value
         elif flag == '--goal-file':
             goal_file = value
@@ -75,8 +79,13 @@ def _parse_run(args: list[str], *, instruction_parser=codex_instruction) -> tupl
     if agent_options.get('context_mode', 'metadata') not in {'metadata', 'redacted'}:
         raise ValueError('--context-mode must be metadata or redacted')
     from .judges import JUDGE_PROVIDERS
-    if judge_options.get('provider', os.environ.get('TRACEWARD_JUDGE_PROVIDER', 'lmstudio')) not in JUDGE_PROVIDERS:
+    if not server_analysis and judge_options.get('provider', os.environ.get('TRACEWARD_JUDGE_PROVIDER', 'lmstudio')) not in JUDGE_PROVIDERS:
         raise ValueError('judge provider must be lmstudio or openrouter')
+    selected = agent_options.get('agent_id') or agent_options.get('agent_slug')
+    if agent_options.get('agent_id') and agent_options.get('agent_slug'):
+        raise ValueError('choose --agent-id or --agent-slug, not both')
+    if selected:
+        goal = goal_file = None
     if goal is not None and goal_file is not None:
         raise ValueError('choose --goal or --goal-file, not both')
     agent_args = args[index + 1:]
@@ -87,7 +96,7 @@ def _parse_run(args: list[str], *, instruction_parser=codex_instruction) -> tupl
             raise ValueError('goal cannot be empty')
         # Explicit operator scope does not depend on recovering a launch prompt.
         # Preserve stdin and all agent arguments, including interactive starts.
-    else:
+    elif not selected:
         goal, agent_args = instruction_parser(agent_args)
     return goal, agent_args, image, workspace, guest_image, judge_options, agent_options
 
@@ -133,7 +142,7 @@ def _write_manifest(path: Path, run_id: str, goal: str | None, started_at: float
         temporary.unlink(missing_ok=True)
 
 
-def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_name='codex',
+def _local_run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_name='codex',
         instruction_parser=codex_instruction) -> int:
     goal, codex_args, image, workspace, guest_image, judge_options, agent_options = _parse_run(
         args, instruction_parser=instruction_parser)
@@ -404,28 +413,33 @@ def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_na
             signal.signal(signum, handler)
 
 
-def watch(run_id: str) -> int:
-    run_dir = _safe_run_dir(run_id)
-    if not run_dir.is_dir():
-        raise ValueError(f"run not found: {run_id}")
-    path = run_dir / "findings.jsonl"
-    offset, pending = 0, ""
+def run(args: list[str], *, runtime_factory=None, runtime_options=None, agent_name='codex',
+        instruction_parser=codex_instruction) -> int:
+    from .capture import run as remote_run
+    return remote_run(args,runtime_factory=runtime_factory,runtime_options=runtime_options,
+                      agent_name=agent_name,instruction_parser=instruction_parser)
+
+
+def watch(run_id: str, url=None) -> int:
+    from .remote import Client
+    client=Client(url)
+    run_id=str(uuid.UUID(run_id))
+    seen=set()
     while True:
-        lines, offset, pending = _tail_lines(path, offset, pending)
-        for line in lines:
-            try:
-                item = assessment_record(json.loads(line))
-            except ValueError:
-                continue
+        run=client.get('/runs/'+run_id)
+        for item in client.get('/runs/'+run_id+'/findings')['findings']:
+            key=(item['finding_id'],item['revision'])
+            if key in seen:continue
+            seen.add(key)
             print(f"{item['time']:.3f} r{item['revision']} {item['finding_id']} {item['title']}")
             print(f"  {item['message']}")
             if item.get("uncalibrated_risk_score") is not None:
                 print(f"  Model uncalibrated risk score: {item['uncalibrated_risk_score']}")
             if item.get('judge', {}).get('rationale'):
                 print(f"  Model: {item['judge'].get('model')} — {item['judge']['rationale']}")
-        if (run_dir / "summary.json").exists():
+        if run['capture_state'] in {'complete','failed','interrupted'} and run['analysis_state'] in {'complete','incomplete'}:
             return 0
-        time.sleep(0.2)
+        time.sleep(2)
 
 
 def _agent_argument(args):
@@ -448,7 +462,7 @@ def _pi_harness():
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     try:
-        load_observer_env()
+        load_observer_env(extra_keys={'TRACEWARD_URL'},observer=not bool(args and args[0] in {'run','sync','watch'}))
         if not args or args[0] in {"-h", "--help"}:
             print(_usage())
             return 0
@@ -456,22 +470,28 @@ def main(argv: list[str] | None = None) -> int:
             if _agent_argument(args[1:]) == 'pi':
                 return _pi_harness().run(args[1:])
             return run(args[1:])
+        if args[0] == 'sync':
+            from .remote import sync_main
+            return sync_main(args[1:])
+        if args[0] == 'backend':
+            from .backend import main as backend_main
+            return backend_main(args[1:])
         if args[:2] == ['eval', 'pi']:
             return _pi_harness().main(['eval', *args[2:]])
-        if args[0] == "watch" and len(args) == 2:
-            return watch(args[1])
+        if args[0] == "watch":
+            import argparse
+            parser=argparse.ArgumentParser(prog='traceward watch')
+            parser.add_argument('run_id');parser.add_argument('--traceward-url')
+            options=parser.parse_args(args[1:])
+            return watch(options.run_id,options.traceward_url)
         if args[0] == "dashboard":
-            from .dashboard import main as dashboard_main
-            return dashboard_main(args[1:])
+            from .backend import main as backend_main
+            return backend_main(args[1:])
         if args[0] == "replay":
             from .replay import replay
             return replay(args[1:])
         if args == ['rebuild-graph']:
-            from .graph import EvidenceGraph
-            graph = EvidenceGraph(state_root().parent/'evidence-graph.sqlite','rebuild')
-            try: print(f'Rebuilt {graph.rebuild(state_root())} observations from JSONL')
-            finally: graph.close()
-            return 0
+            raise ValueError('the backend rebuilds correlation from PostgreSQL inputs during recovery; local graphs are evaluation-only')
         raise ValueError(_usage())
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"traceward: {exc}", file=sys.stderr)

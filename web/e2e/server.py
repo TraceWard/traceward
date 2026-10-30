@@ -1,5 +1,6 @@
 """Disposable JSONL-backed browser regression server. All decisions are synthetic."""
 import json
+import os
 import tempfile
 import time
 from pathlib import Path
@@ -33,8 +34,24 @@ for i in range(30):
    'started_at': time.time()-3600-i, 'heartbeat_at': 0, 'source': 'pi' if i%2 else 'codex', 'observer_version': 'gvisor-v1'}))
  if i%3:
   (extra/'summary.json').write_text(json.dumps({'codex_exit_code': 0}))
-index = RunIndex(runs,root/'index.sqlite')
+if os.environ.get('TRACEWARD_BROWSER_DATABASE_URL'):
+ from postgres_fixtures import FixtureIndex
+ index = FixtureIndex(runs,os.environ['TRACEWARD_BROWSER_DATABASE_URL'])
+else:
+ index = RunIndex(runs,root/'index.sqlite')
 app = create_app(index,Path(__file__).resolve().parents[2]/'src/traceward/dashboard_assets')
+
+@app.post('/test/filters')
+def filter_fixture():
+ identity='77777777-7777-4777-8777-777777777777'
+ destination=runs/identity;destination.mkdir(mode=0o700,exist_ok=True)
+ (destination/'run.json').write_text(json.dumps({'goal':'Synthetic server-filter regression','started_at':100,'heartbeat_at':time.time(),'source':'scripted_agent','observer_version':'gvisor-v1'}))
+ ledger=EvidenceStore(destination,identity)
+ ledger.event('file_delete',dict(event_id='old-deletion',time=101,pid=7,path='/workspace/audit/retained.log',source='gvisor',operation_status='succeeded'))
+ ledger.event('http_request',dict(event_id='old-http',time=102,pid=7,source='http_inspection',method='POST',url='https://example.test/fixture',phase='request'))
+ for n in range(600):
+  ledger.event('hook',dict(event_id=f'new-hook-{n}',time=200+n,source='pi_extension',event='MessageUpdate'))
+ return {'run_id':identity}
 
 @app.post('/test/operation-chain/{phase}')
 def operation_chain_fixture(phase: str):

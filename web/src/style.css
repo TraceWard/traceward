@@ -376,3 +376,46 @@ summary { cursor: pointer; font-size: 11px; line-height: 1.5; }
 .inline-event-heading button { color: var(--accent); font-size: 11px; flex-shrink: 0; }
 .inline-event-details h3 { font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; }
 .evidence-chain .inline-event-details { margin: 10px; }
+/* Registered agents share the investigation dashboard's layout and theme. */
+.agent-back {display:inline-block;margin-bottom:20px;font-size:12px}
+.agent-card {border:1px solid var(--line);border-radius:5px;padding:22px;margin:0 0 28px;background:var(--surface);max-width:100%;overflow-wrap:anywhere}
+.agent-runs > .listing-page {padding:0}
+.agent-runs .listing-header h1 {font-size:20px}
+.agents-table {min-width:720px}
+.agents-table th:first-child {width:300px}
+.agents-table th:last-child {width:72px}
+.agents-table td {line-height:1.6}
+.agents-table td:first-child {overflow-wrap:anywhere}
+.agents-table th:last-child,.agents-table td:last-child {text-align:right;padding-right:20px}
+.agent-form {display:grid;gap:18px;max-width:850px}
+.agents-actions {display:flex;align-items:center;gap:18px;white-space:nowrap}
+.primary-button {padding:10px 16px;border:1px solid #2563eb;border-radius:6px;background:#2563eb;color:#fff;font:inherit;font-weight:600;cursor:pointer}
+.primary-button:hover:not(:disabled),.agent-form button[type=submit]:hover:not(:disabled) {background:#1d4ed8}
+.agent-dialog {width:min(680px,calc(100vw - 40px));max-height:calc(100dvh - 40px);box-sizing:border-box;padding:26px;border:1px solid var(--line);border-radius:8px;color:var(--ink);background:var(--surface);overflow:auto}
+.agent-dialog::backdrop {background:rgb(15 23 42 / 40%)}
+.agent-form-actions {display:flex;justify-content:flex-end;gap:10px}
+@media(max-width:650px) {.agents-actions {margin-top:18px;justify-content:space-between}.agent-dialog {padding:20px}}
+.agent-form h2 {margin:0;font-size:18px}
+.agent-form label {display:grid;gap:8px;font-weight:600}
+.agent-form label small {font-weight:400;color:#64748b}
+.agent-form input,.agent-form textarea {width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #cbd5e1;border-radius:6px;font:inherit;background:#fff;color:#0f172a}
+.agent-form button,.agent-card button {padding:8px 12px;border:1px solid #cbd5e1;border-radius:6px;background:#f8fafc;cursor:pointer;color:#0f172a}
+.agent-form button[type=submit] {justify-self:start;background:#2563eb;color:#fff;border-color:#2563eb}
+.agent-form button:disabled {opacity:.5;cursor:not-allowed}
+.agent-card dl {display:grid;grid-template-columns:110px minmax(0,1fr);align-items:center;gap:10px 20px;margin:0}
+.agent-card dt {font-weight:600}
+.agent-card dd {margin:0;display:flex;align-items:center;flex-wrap:wrap;gap:8px}
+.agent-card .copy-icon {display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;padding:4px;border:0;border-radius:4px;background:transparent;color:var(--muted);flex:none}
+.agent-card .copy-icon:hover {background:var(--accent-soft);color:var(--accent)}
+.agent-goal {border-top:1px solid var(--line);margin-top:20px;padding-top:20px}
+.agent-goal h2 {margin-bottom:10px;font-size:12px}
+.agent-goal p {white-space:pre-wrap;line-height:1.7;max-width:100ch;margin-bottom:10px}
+.agent-goal small {display:block;color:var(--muted);font-size:11px;line-height:1.5;margin-bottom:20px}
+.agent-command {display:flex;gap:14px;align-items:center;flex-wrap:wrap;padding:12px;background:#f1f5f9;border-radius:6px}
+.agent-command code {flex:1;min-width:0;overflow-wrap:anywhere}
+.agent-command-help {color:var(--muted);font-size:11px;line-height:1.6;margin:10px 0 0}
+.agent-empty {padding:24px;color:#64748b}
+.copy-status {margin:12px 0 0;color:#166534;font-size:12px}
+.run-identity {display:flex;gap:14px;flex-wrap:wrap;align-items:center;padding:12px 16px;background:#f1f5f9;border-radius:8px;margin:16px 0;font-size:13px}
+.run-identity span {overflow-wrap:anywhere}
+@media(max-width:650px) {.agent-card {padding:16px}.agent-card dl {grid-template-columns:1fr;gap:8px}.agent-card dd {margin-bottom:12px}}

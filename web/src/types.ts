@@ -7,6 +7,13 @@ export type Summary = {
 };
 export type Run = {
   run_id: string;
+  agent_id?: string | null;
+  agent_slug?: string | null;
+  capture_state?: string;
+  analysis_state?: string;
+  accepted_seq?: number;
+  processed_seq?: number;
+  analysis_error?: string | null;
   name?: string | null;
   goal: string;
   started_at: number;

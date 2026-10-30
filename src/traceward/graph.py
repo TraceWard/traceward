@@ -32,7 +32,7 @@ class EvidenceGraph:
         self.db.commit()
 
     def add(self, item: dict):
-        allowed = {'event_id', 'kind', 'time', 'source', 'trust', 'role', 'pid', 'parent_pid', 'process_key',
+        allowed = {'event_id', 'agent_id', 'agent_slug', 'kind', 'time', 'source', 'trust', 'role', 'pid', 'parent_pid', 'process_key',
             'parent_process_key', 'process_start_time_ns', 'sandbox_id', 'name', 'path', 'endpoint', 'bytes',
             'pathname', 'start_path', 'dirfd', 'flags', 'directory', 'path_error', 'syscall',
             'operation_status', 'errno', 'result', 'syscall_number', 'raw_trace_ref', 'script_paths',

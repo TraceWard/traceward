@@ -1,0 +1,58 @@
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: traceward
+      POSTGRES_USER: traceward
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-traceward-local}
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U traceward -d traceward"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+  backend:
+    build:
+      context: .
+      target: backend
+    environment:
+      DATABASE_URL: postgresql://postgres:5432/traceward
+      PGUSER: traceward
+      PGPASSWORD: ${POSTGRES_PASSWORD:-traceward-local}
+      TRACEWARD_PUBLIC_HOST: ${TRACEWARD_PUBLIC_HOST:-0.0.0.0}
+      TRACEWARD_PUBLIC_ORIGIN: ${TRACEWARD_PUBLIC_ORIGIN:-}
+      TRACEWARD_JUDGE_PROVIDER: ${TRACEWARD_JUDGE_PROVIDER:-lmstudio}
+      TRACEWARD_JUDGE_MODEL: ${TRACEWARD_JUDGE_MODEL:-qwen/qwen3.8-27b}
+      TRACEWARD_JUDGE_URL: ${TRACEWARD_BACKEND_JUDGE_URL:-http://host.docker.internal:1234/v1/chat/completions}
+      LMSTUDIO_API_KEY: ${LMSTUDIO_API_KEY:-}
+      OPENROUTER_KEY: ${OPENROUTER_KEY:-}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+  ui:
+    build:
+      context: .
+      target: ui
+    ports:
+      - '${TRACEWARD_BIND:-127.0.0.1}:${TRACEWARD_PORT:-8765}:80'
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1/api/health]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+volumes:
+  postgres-data:

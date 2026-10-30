@@ -254,7 +254,7 @@ class RunIndex:
 
     def events(self, run_id: str, *, before: int | None = None, limit: int = 250,
                kind: str | None = None, source: str | None = None, pid: int | None = None,
-               hook_event: str | None = None) -> dict:
+               hook_event: str | None = None, runtime_only: bool = False) -> dict:
         with self.lock:
             query = "SELECT id,body FROM events WHERE run_id=?"
             values: list = [_run_id(run_id)]
@@ -265,6 +265,10 @@ class RunIndex:
                     return {"events": [], "next_before": None}
                 query += " AND (COALESCE(time_ms,0),id)<(?,?)"
                 values.extend([cursor["time_ms"], cursor["id"]])
+            if kind=='finding':
+                query += " AND kind IN ('finding','assessment')"
+                kind=None
+            if runtime_only:query += " AND kind NOT IN ('hook','finding','assessment','coverage')"
             for clause, value in (("kind=?", kind), ("source=?", source), ("pid=?", pid)):
                 if value is not None:
                     query += " AND " + clause
@@ -406,7 +410,7 @@ class RunIndex:
         return {"source": source, "lines": excerpt, "truncated": len(excerpt) >= 81}
 
 
-def create_app(index: RunIndex, assets: Path | None = None, *, bind_host: str = "0.0.0.0"):
+def create_app(index: RunIndex, assets: Path | None = None, *, bind_host: str = "0.0.0.0", public_origin: str | None = None):
     try:
         from fastapi import FastAPI, HTTPException, Query, Request
         from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -430,8 +434,9 @@ def create_app(index: RunIndex, assets: Path | None = None, *, bind_host: str = 
             try:
                 parsed = urlsplit(origin)
                 default_ports = {"http": 80, "https": 443}
+                expected = urlsplit(public_origin) if public_origin else request.url
                 same_origin = (parsed.scheme, parsed.hostname, parsed.port or default_ports.get(parsed.scheme)) == (
-                    request.url.scheme, host, request.url.port or default_ports.get(request.url.scheme))
+                    expected.scheme, expected.hostname, expected.port or default_ports.get(expected.scheme))
             except ValueError:
                 same_origin = False
             if not same_origin:
@@ -453,6 +458,7 @@ def create_app(index: RunIndex, assets: Path | None = None, *, bind_host: str = 
 
     @app.get("/api/health")
     def health():
+        index.refresh()
         return {"status": "ok", "runs_dir": str(index.runs_dir)}
 
     @app.get("/api/runs")
@@ -473,10 +479,10 @@ def create_app(index: RunIndex, assets: Path | None = None, *, bind_host: str = 
     @app.get("/api/runs/{run_id}/events")
     def events(run_id: str, before: int | None = None, limit: int = 250,
                kind: str | None = None, source: str | None = None, pid: int | None = None,
-               hook_event: str | None = None):
+               hook_event: str | None = None, scope: str | None = None):
         index.refresh()
         required_run(run_id)
-        return index.events(run_id, before=before, limit=limit, kind=kind, source=source, pid=pid, hook_event=hook_event)
+        return index.events(run_id, before=before, limit=limit, kind=kind, source=source, pid=pid, hook_event=hook_event,runtime_only=scope=='runtime')
 
     @app.get("/api/runs/{run_id}/findings")
     def findings(run_id: str):

@@ -32,7 +32,7 @@ def parse_run(args):
 
 
 def run(args):
-    load_observer_env(extra_keys={'TRACEWARD_PI_TOKEN'})
+    load_observer_env(extra_keys={'TRACEWARD_PI_TOKEN','TRACEWARD_URL'},observer=False)
     remaining,options=_options(args)
     return core.run(remaining,runtime_factory=PiRuntime,runtime_options=options,agent_name='pi',
                     instruction_parser=pi_instruction)
@@ -41,7 +41,7 @@ def run(args):
 def main(argv=None):
     args=list(sys.argv[1:] if argv is None else argv)
     try:
-        load_observer_env(extra_keys={'TRACEWARD_PI_TOKEN'})
+        load_observer_env(extra_keys={'TRACEWARD_PI_TOKEN','TRACEWARD_URL'},observer=not bool(args and args[0]=='run'))
         if args and args[0]=='eval':
             from .evaluate import main as evaluate
             return evaluate(args[1:])

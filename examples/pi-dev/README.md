@@ -8,23 +8,20 @@ From the TraceWard repository root:
 docker build --tag traceward-pi-dev:local examples/pi-dev
 ```
 
-Run from the project directory you want Pi to work in. With Docker running and both selected models available on LM Studio:
+Run from the project directory you want Pi to work in, with the TraceWard stack running and the actor model available on LM Studio. Configure the judge on the backend as described in the [setup guide](../../docs/backend.md).
 
 ```sh
-/Users/deepal/Projects/traceward/.venv/bin/python -m traceward_pi.cli run \
+traceward run --traceward-url http://localhost:8765 \
   --guest-image traceward-pi-dev:local \
   --pi-network bridge \
   --pi-model qwen3.8-27b-uncensored \
   --pi-url http://127.0.0.1:1234/v1/chat/completions \
-  --judge-provider lmstudio \
-  --judge-model qwen/qwen3.8-27b \
-  --judge-url http://127.0.0.1:1234/v1/chat/completions \
   pi "Inspect this project and explain how to run its tests."
 ```
 
-Replace the absolute Python path with your checkout's virtual environment on another machine. The current directory and its containing workspace are mounted into the guest. Execution uses Linux binaries, not programs installed on macOS. TraceWard supplies its observer code and the model relay separately from this guest image.
+Activate the checkout's virtual environment so `traceward` is on your path. The current directory and its containing workspace are mounted into the guest. Execution uses Linux binaries, not programs installed on macOS. TraceWard supplies its observer code and the model relay separately from this guest image.
 
-For the local `tpi` function configured in this session, reload the updated function and select the same options before any Pi arguments:
+If you configured a `tpi` shell helper, select the same options before any Pi arguments:
 
 ```sh
 source ~/.zshrc

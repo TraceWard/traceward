@@ -4,11 +4,13 @@ import type { Run, Event, Finding, Raw, OperationChain } from "./types";
 import { RunsView, FindingsView, readRoute } from "./views";
 import ActivityChart from './ActivityChart';
 import OperationChainView from './OperationChain';
+import AgentsView from './Agents';
 
 const short = (value: string, size = 8) => value?.slice(0, size) || "—";
 const date = (value?: number, millis = false) =>
   value ? new Date(value * (millis ? 1 : 1000)).toLocaleString() : "—";
 const kind = (event: Event) => {
+  if (event.unmapped?.traceward?.event_kind === 'assessment') return 'finding';
   if (event.unmapped?.traceward?.event_kind) return event.unmapped.traceward.event_kind;
   if (event.class_uid === 0)
     return event.unmapped?.traceward?.hook_event ? "hook" : "coverage";
@@ -234,7 +236,8 @@ export default function App() {
   const [hookFilter, setHookFilter] = useState('all');
   const [hookNames, setHookNames] = useState<string[]>([]);
   const hooksOnly = view === 'hooks' || filter === 'hook';
-  const eventQuery = hooksOnly ? `&kind=hook${hookFilter === 'all' ? '' : `&hook_event=${encodeURIComponent(hookFilter)}`}` : '';
+  const eventQuery = hooksOnly ? `&kind=hook${hookFilter === 'all' ? '' : `&hook_event=${encodeURIComponent(hookFilter)}`}`
+    : `${filter !== 'all' && filter !== 'evidence' ? `&kind=${encodeURIComponent(filter)}` : ''}${view === 'runtime' ? '&scope=runtime' : ''}`;
   const [error, setError] = useState("");
   const [raw, setRaw] = useState<Raw | null>(null);
   const [older, setOlder] = useState<number | null>(null);
@@ -482,6 +485,9 @@ export default function App() {
         </a>
         <nav className="side-section" aria-label="Main navigation">
           <span>OBSERVABILITY</span>
+          <a href="#agents" className={route.page === "agents" ? "nav-link active" : "nav-link"} aria-current={route.page === "agents" ? "page" : undefined}>
+            <span aria-hidden="true">◉</span> Agents
+          </a>
           <a href="#runs" className={route.page === "runs" ? "nav-link active" : "nav-link"} aria-current={route.page === "runs" ? "page" : undefined}>
             <span aria-hidden="true">▦</span> Agent Runs <em>{runs.length}</em>
           </a>
@@ -489,22 +495,23 @@ export default function App() {
             <span aria-hidden="true">⚑</span> Findings <em>{allFindings.length}</em>
           </a>
         </nav>
-        <div className="side-footer">Local workspace<small>Read-only · Observe-only</small></div>
+        <div className="side-footer">TraceWard workspace<small>Trusted network · Observe-only</small></div>
       </aside>
       <main className="main">
         <header className="topbar">
           <div className="breadcrumb">
-            <a href={route.page === "findings" ? "#findings" : "#runs"}>{route.page === "findings" ? "Findings" : "Agent Runs"}</a>
+            <a href={route.page === "agents" ? "#agents" : route.page === "findings" ? "#findings" : "#runs"}>{route.page === "agents" ? "Agents" : route.page === "findings" ? "Findings" : "Agent Runs"}</a>
             {runId && <><span>/</span><b>Investigation</b></>}
           </div>
-          <span className="local-label">Local workspace</span>
+          <span className="local-label">TraceWard backend</span>
         </header>
         {error && <div className="error-banner">{error}</div>}
+        {route.page === 'agents' && <AgentsView agentId={route.agentId} runs={runs} runsLoaded={listsLoaded} />}
         <div hidden={Boolean(runId) || route.page !== "runs"}><RunsView runs={runs} loaded={listsLoaded} /></div>
         <div hidden={Boolean(runId) || route.page !== "findings"}><FindingsView runs={runs} findings={allFindings} loaded={listsLoaded} /></div>
         {!runId ? null : !run ? (
           <div className="welcome"><h1>{listsLoaded ? "Run not found" : "Loading investigation…"}</h1>
-            <p>{listsLoaded ? "This run is not available in the current workspace." : "Reading local evidence."}</p>
+            <p>{listsLoaded ? "This run is not available in the current workspace." : "Loading run details."}</p>
             <a href="#runs">Back to Agent Runs</a>
           </div>
         ) : (
@@ -514,7 +521,7 @@ export default function App() {
                 <div className="eyebrow">
                   RUN{" "}
                   <span className={`status-label ${run.status}`}>
-                    {run.status}{run.analysis_incomplete ? " · analysis incomplete" : ""}
+                    {run.status}{run.analysis_state ? ` · analysis ${run.analysis_state}` : run.analysis_incomplete ? " · analysis incomplete" : ""}
                   </span>
                 </div>
                 <h1>Agent Run Investigation</h1>
@@ -524,6 +531,13 @@ export default function App() {
                 </p>
               </div>
             </div>
+            {run.capture_state && <section className="run-identity" aria-label="Run attribution and processing status">
+              {run.agent_id ? <a href={`#agents/${run.agent_id}`}>{run.agent_slug}</a> : <span>Unattributed</span>}
+              <span>Capture: {run.capture_state}</span><span>Analysis: {run.analysis_state}</span>
+              <span>{run.processed_seq ?? 0} / {run.accepted_seq ?? 0} uploaded inputs processed</span>
+              {run.capture_state === 'disconnected' && <span role="status">Collector disconnected; capture is incomplete. Retained evidence remains available.</span>}
+              {run.analysis_error && <span role="alert">{run.analysis_error}</span>}
+            </section>}
             <section className="goal-card">
               <div className="goal-icon">◎</div>
               <div>
@@ -559,7 +573,7 @@ export default function App() {
               </div>
             </div>
             {run.telemetry_status && run.telemetry_status.status !== 'complete' && <p className="coverage-status" role="status">{run.telemetry_status.message}</p>}
-            {run.analysis_incomplete && <p className="analysis-status" role="status">Session ended; final analysis is incomplete.</p>}
+            {run.analysis_incomplete && run.status !== 'live' && <p className="analysis-status" role="status">{run.analysis_state === 'running' || run.analysis_state === 'pending' ? 'Capture ended; the backend is finishing analysis.' : 'Session ended; final analysis is incomplete.'}</p>}
             <ActivityChart key={runId} runId={runId} live={run.status === 'live'} onFinding={id => {
               setSelectedFinding(id); setAssessmentAudit(false);
               window.location.hash = `runs/${runId}?finding=${id}&view=findings`;
@@ -686,7 +700,7 @@ export default function App() {
                     {eventOrder === 'newest' && older && (filter !== 'evidence' || !finding) && <button className="load-more" onClick={() => void loadOlder()}>Load earlier events</button>}
                     {!shown.length && (
                       <div className="empty-list">
-                        No events match this view.
+                        {loadedRun === runId ? 'No events match this view.' : 'Loading events…'}
                       </div>
                     )}
                   </div>

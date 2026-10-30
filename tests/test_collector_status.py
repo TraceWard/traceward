@@ -94,7 +94,7 @@ class CollectorStatusTests(unittest.TestCase):
                  patch('traceward.cli.GvisorParser',Parser), \
                  patch('traceward.judges.judge',return_value={'status':'assessed','disposition':'inconclusive',
                      'rationale':'Synthetic drain-order check','evidence_ids':[]}):
-                self.assertEqual(cli.run(['--goal','Read only','--defer-judge','codex'],runtime_factory=Runtime),0)
+                self.assertEqual(cli._local_run(['--goal','Read only','--defer-judge','codex'],runtime_factory=Runtime),0)
             run=next((root/'state/traceward/runs').iterdir())
             events=[json.loads(line) for line in (run/'events.jsonl').read_text().splitlines()]
             self.assertTrue(any(e['unmapped']['traceward'].get('event_kind')=='file_delete' for e in events))

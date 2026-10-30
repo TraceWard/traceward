@@ -212,6 +212,7 @@ test('long evidence streams keep event details reachable without nested scrollin
  await page.goto(`/#runs/${id}?view=evidence`);
  await page.getByLabel('Event type').selectOption('all');
  await expect(page.getByLabel('Event order')).toHaveValue('newest');
+ await expect.poll(()=>page.locator('[data-time]').count()).toBeGreaterThan(200);
  const times=await page.locator('[data-time]').evaluateAll(items=>items.map(i=>Number(i.getAttribute('data-time'))));
  expect(times.length).toBeGreaterThan(200);
  expect(times).toEqual([...times].sort((a,b)=>b-a));
@@ -518,4 +519,18 @@ test('a slow operation projection completes across the live polling cycle',async
  expect(projections).toBe(1);
  release();
  await expect(page.getByRole('region',{name:'How this happened'}).locator('[data-finding-effect=true]')).toContainText('/workspace/.env');
+});
+
+test('event filters query older evidence beyond the first page',async({page,request})=>{
+ const fixture=await (await request.post('/test/filters')).json();
+ await page.goto(`/#runs/${fixture.run_id}?view=evidence`);
+ await page.getByLabel('Event type',{exact:true}).selectOption('file_delete');
+ await expect(page.locator('[data-event-id="old-deletion"]')).toBeVisible();
+ await page.getByLabel('Event type',{exact:true}).selectOption('http_request');
+ await expect(page.locator('[data-event-id="old-http"]')).toBeVisible();
+ await page.getByRole('button',{name:'Runtime only',exact:true}).click();
+ await page.getByLabel('Event type',{exact:true}).selectOption('all');
+ await expect(page.locator('[data-event-id="old-deletion"]')).toBeVisible();
+ await expect(page.locator('[data-event-id="old-http"]')).toBeVisible();
+ await expect(page.locator('[data-time]')).toHaveCount(2);
 });
